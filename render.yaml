@@ -1,0 +1,33 @@
+services:
+  - type: web
+    name: shopify-zoho-books
+    env: node
+    plan: starter
+    buildCommand: ""
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3000
+      - key: SHOPIFY_WEBHOOK_SECRET
+        sync: false
+      - key: ZOHO_ACCOUNTS_DOMAIN
+        sync: false
+      - key: ZOHO_API_DOMAIN
+        sync: false
+      - key: ZOHO_CLIENT_ID
+        sync: false
+      - key: ZOHO_CLIENT_SECRET
+        sync: false
+      - key: ZOHO_REFRESH_TOKEN
+        sync: false
+      - key: ZOHO_ORGANIZATION_ID
+        sync: false
+      - key: ZOHO_DEFAULT_ITEM_ID
+        sync: false
+      - key: ZOHO_DEFAULT_TAX_ID
+        sync: false
+      - key: ZOHO_DEFAULT_PAYMENT_TERMS
+        value: 0
