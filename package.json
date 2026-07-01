@@ -1,0 +1,16 @@
+{
+  "name": "shopify-zoho-books-invoices",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check:config": "node --env-file=.env scripts/check-config.js",
+    "setup:tax": "node --env-file=.env scripts/setup-tax.js",
+    "setup:zoho": "node scripts/setup-zoho.js",
+    "start": "node src/server.js",
+    "start:local": "node --env-file=.env src/server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
