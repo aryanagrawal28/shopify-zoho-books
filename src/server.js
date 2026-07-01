@@ -5,15 +5,15 @@ import http from "node:http";
 const config = {
   port: Number(process.env.PORT ?? 3000),
   shopifyWebhookSecret: requiredEnv("SHOPIFY_WEBHOOK_SECRET"),
-  zohoAccountsDomain: process.env.ZOHO_ACCOUNTS_DOMAIN ?? "https://accounts.zoho.com",
-  zohoApiDomain: process.env.ZOHO_API_DOMAIN ?? "https://www.zohoapis.com",
+  zohoAccountsDomain: optionalEnv("ZOHO_ACCOUNTS_DOMAIN", "https://accounts.zoho.com"),
+  zohoApiDomain: optionalEnv("ZOHO_API_DOMAIN", "https://www.zohoapis.com"),
   zohoClientId: requiredEnv("ZOHO_CLIENT_ID"),
   zohoClientSecret: requiredEnv("ZOHO_CLIENT_SECRET"),
   zohoRefreshToken: requiredEnv("ZOHO_REFRESH_TOKEN"),
   zohoOrganizationId: requiredEnv("ZOHO_ORGANIZATION_ID"),
   zohoDefaultItemId: requiredEnv("ZOHO_DEFAULT_ITEM_ID"),
-  zohoDefaultTaxId: process.env.ZOHO_DEFAULT_TAX_ID,
-  defaultPaymentTerms: Number(process.env.ZOHO_DEFAULT_PAYMENT_TERMS ?? 0)
+  zohoDefaultTaxId: optionalEnv("ZOHO_DEFAULT_TAX_ID"),
+  defaultPaymentTerms: Number(optionalEnv("ZOHO_DEFAULT_PAYMENT_TERMS", "0"))
 };
 
 const processedWebhookIds = new Set();
@@ -95,6 +95,16 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(config.port, () => {
   console.log(`Shopify to Zoho Books webhook server listening on :${config.port}`);
+  console.log("Loaded config", {
+    zohoAccountsDomain: config.zohoAccountsDomain,
+    zohoApiDomain: config.zohoApiDomain,
+    zohoClientId: redact(config.zohoClientId),
+    zohoClientSecret: redact(config.zohoClientSecret),
+    zohoRefreshToken: redact(config.zohoRefreshToken),
+    zohoOrganizationId: config.zohoOrganizationId,
+    zohoDefaultItemId: config.zohoDefaultItemId,
+    zohoDefaultTaxId: config.zohoDefaultTaxId
+  });
 });
 
 async function processShopifyOrder(order) {
@@ -289,13 +299,17 @@ function sendJson(res, statusCode, body) {
 }
 
 function requiredEnv(name) {
-  const value = process.env[name];
+  const value = process.env[name]?.trim();
 
   if (!value) {
     throw new Error(`Missing required environment variable: ${name}`);
   }
 
   return value;
+}
+
+function optionalEnv(name, defaultValue) {
+  return process.env[name]?.trim() || defaultValue;
 }
 
 function log(message, details = {}) {
@@ -307,4 +321,16 @@ function log(message, details = {}) {
 
   console.log(message, details);
   fs.appendFileSync("webhook.log", `${JSON.stringify(entry)}\n`);
+}
+
+function redact(value) {
+  if (!value) {
+    return "missing";
+  }
+
+  if (value.length <= 10) {
+    return "*".repeat(value.length);
+  }
+
+  return `${value.slice(0, 5)}...${value.slice(-4)} (${value.length} chars)`;
 }
