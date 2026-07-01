@@ -2,7 +2,7 @@ services:
   - type: web
     name: shopify-zoho-books
     env: node
-    plan: starter
+    plan: free
     buildCommand: ""
     startCommand: npm start
     healthCheckPath: /health
