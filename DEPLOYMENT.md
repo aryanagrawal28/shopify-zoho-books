@@ -2,7 +2,7 @@
 
 Localtunnel is only for testing. For live Shopify webhooks, deploy this Node app to an always-on server with HTTPS, then replace the Shopify webhook URL with the permanent production URL.
 
-The fastest managed path is Render, Railway, Fly.io, or any VPS. This repo includes:
+The fastest managed testing path is Render Free, Railway, Fly.io, or any VPS. This repo includes:
 
 - `render.yaml` for a Render web service
 - `Dockerfile` for Docker/VPS deployment
@@ -89,6 +89,7 @@ Put Nginx or another reverse proxy in front of the app so Shopify can reach it a
 ## Important
 
 - Do not use localtunnel for production.
+- Render Free web services spin down after idle time, so use it for testing or low-stakes automation. For truly continuous webhook reliability, use a paid always-on instance or a VPS.
 - Do not commit `.env`.
 - Keep only one Shopify `orders/create` webhook active for this service to avoid duplicate invoices.
 - If you regenerate any secret/token, update the production environment and restart the app.
