@@ -13,6 +13,7 @@ const config = {
   zohoOrganizationId: requiredEnv("ZOHO_ORGANIZATION_ID"),
   zohoDefaultItemId: requiredEnv("ZOHO_DEFAULT_ITEM_ID"),
   zohoDefaultTaxId: optionalEnv("ZOHO_DEFAULT_TAX_ID"),
+  zohoInclusiveTax: parseBoolean(optionalEnv("ZOHO_INCLUSIVE_TAX", "true")),
   defaultPaymentTerms: Number(optionalEnv("ZOHO_DEFAULT_PAYMENT_TERMS", "0"))
 };
 
@@ -103,7 +104,8 @@ server.listen(config.port, () => {
     zohoRefreshToken: redact(config.zohoRefreshToken),
     zohoOrganizationId: config.zohoOrganizationId,
     zohoDefaultItemId: config.zohoDefaultItemId,
-    zohoDefaultTaxId: config.zohoDefaultTaxId
+    zohoDefaultTaxId: config.zohoDefaultTaxId,
+    zohoInclusiveTax: config.zohoInclusiveTax
   });
 });
 
@@ -210,21 +212,40 @@ async function createZohoInvoice(accessToken, payload) {
 }
 
 function mapShopifyOrderToZohoInvoice(order, customerId) {
+  const lineItems = order.line_items.map((item) => {
+    const discountAmount = getShopifyLineItemDiscountAmount(item);
+
+    return withoutUndefined({
+      item_id: getZohoItemIdForShopifyLineItem(item),
+      tax_id: config.zohoDefaultTaxId || undefined,
+      name: item.title,
+      description: [item.variant_title, `Shopify line item ${item.id}`].filter(Boolean).join(" - "),
+      rate: money(item.price),
+      quantity: Number(item.quantity),
+      discount_amount: discountAmount > 0 ? discountAmount : undefined
+    });
+  });
+  const hasLineDiscounts = lineItems.some((item) => Number(item.discount_amount ?? 0) > 0);
+  const totalDiscount = getShopifyOrderDiscountAmount(order);
+  const discountNote = getShopifyDiscountNote(order, totalDiscount);
+
   return {
     customer_id: customerId,
     date: (order.created_at ?? new Date().toISOString()).slice(0, 10),
     reference_number: order.name ?? String(order.id),
     payment_terms: config.defaultPaymentTerms,
-    line_items: order.line_items.map((item) => ({
-      item_id: getZohoItemIdForShopifyLineItem(item),
-      tax_id: config.zohoDefaultTaxId || undefined,
-      name: item.title,
-      description: [item.variant_title, `Shopify line item ${item.id}`].filter(Boolean).join(" - "),
-      rate: Number(item.price),
-      quantity: Number(item.quantity)
-    })),
-    shipping_charge: Number(order.total_shipping_price_set?.shop_money?.amount ?? 0),
-    notes: `Created automatically from Shopify order ${order.name ?? order.id}`
+    is_inclusive_tax: config.zohoInclusiveTax,
+    is_discount_before_tax: true,
+    discount_type: hasLineDiscounts ? "item_level" : undefined,
+    line_items: lineItems,
+    shipping_charge: money(order.total_shipping_price_set?.shop_money?.amount ?? 0),
+    notes: [
+      `Created automatically from Shopify order ${order.name ?? order.id}`,
+      discountNote,
+      config.zohoInclusiveTax ? "Shopify product prices are treated as GST-inclusive." : null
+    ]
+      .filter(Boolean)
+      .join("\n")
   };
 }
 
@@ -293,6 +314,70 @@ function mapAddress(address) {
   };
 }
 
+function getShopifyLineItemDiscountAmount(item) {
+  const allocationDiscount = (item.discount_allocations ?? []).reduce((total, allocation) => {
+    return total + money(allocation.amount_set?.shop_money?.amount ?? allocation.amount);
+  }, 0);
+
+  if (allocationDiscount > 0) {
+    return roundMoney(allocationDiscount);
+  }
+
+  return roundMoney(money(item.total_discount_set?.shop_money?.amount ?? item.total_discount));
+}
+
+function getShopifyOrderDiscountAmount(order) {
+  return roundMoney(
+    money(
+      order.current_total_discounts_set?.shop_money?.amount ??
+        order.total_discounts_set?.shop_money?.amount ??
+        order.current_total_discounts ??
+        order.total_discounts
+    )
+  );
+}
+
+function getShopifyDiscountNote(order, totalDiscount) {
+  if (totalDiscount <= 0) {
+    return null;
+  }
+
+  const codeDetails = (order.discount_codes ?? [])
+    .map((discountCode) => {
+      return [discountCode.code, discountCode.type, discountCode.amount].filter(Boolean).join(" ");
+    })
+    .filter(Boolean);
+  const applicationDetails = (order.discount_applications ?? [])
+    .map((discountApplication) => {
+      return [
+        discountApplication.code ?? discountApplication.title,
+        discountApplication.type,
+        discountApplication.value ? `${discountApplication.value}${discountApplication.value_type === "percentage" ? "%" : ""}` : null
+      ]
+        .filter(Boolean)
+        .join(" ");
+    })
+    .filter(Boolean);
+  const details = [...new Set([...codeDetails, ...applicationDetails])];
+
+  return [`Shopify discount total: ${totalDiscount}`, details.length ? `Discount details: ${details.join(", ")}` : null]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function money(value) {
+  const amount = Number(value ?? 0);
+  return Number.isFinite(amount) ? amount : 0;
+}
+
+function roundMoney(value) {
+  return Math.round((value + Number.EPSILON) * 100) / 100;
+}
+
+function withoutUndefined(object) {
+  return Object.fromEntries(Object.entries(object).filter(([, value]) => value !== undefined));
+}
+
 function sendJson(res, statusCode, body) {
   res.writeHead(statusCode, { "Content-Type": "application/json" });
   res.end(JSON.stringify(body));
@@ -310,6 +395,10 @@ function requiredEnv(name) {
 
 function optionalEnv(name, defaultValue) {
   return process.env[name]?.trim() || defaultValue;
+}
+
+function parseBoolean(value) {
+  return ["1", "true", "yes", "on"].includes(String(value).trim().toLowerCase());
 }
 
 function log(message, details = {}) {
