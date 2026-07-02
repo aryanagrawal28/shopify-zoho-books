@@ -31,3 +31,5 @@ services:
         sync: false
       - key: ZOHO_DEFAULT_PAYMENT_TERMS
         value: 0
+      - key: ZOHO_INCLUSIVE_TAX
+        value: true
