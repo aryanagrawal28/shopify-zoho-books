@@ -42,6 +42,10 @@ Edit `mapShopifyOrderToZohoInvoice` in `src/server.js`.
 
 Zoho invoice line items need a Zoho `item_id`. The starter uses `ZOHO_DEFAULT_ITEM_ID` for every Shopify line item so you can test the integration quickly. For cleaner accounting, replace that with a mapping from Shopify `variant_id`, `product_id`, or `sku` to the matching Zoho item.
 
+Shopify line-item discounts are sent to Zoho as item-level `discount_amount` values. Discount codes and discount application details are added to the Zoho invoice notes.
+
+By default, `ZOHO_INCLUSIVE_TAX=true`, so Shopify prices are treated as GST-inclusive. For example, a ₹100 Shopify line with 5% GST remains ₹100 total in Zoho, with tax calculated inside that price instead of being added on top.
+
 ## 4. Run locally
 
 ```bash
