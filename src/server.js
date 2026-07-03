@@ -213,30 +213,27 @@ async function createZohoInvoice(accessToken, payload) {
 
 function mapShopifyOrderToZohoInvoice(order, customerId) {
   const lineItems = order.line_items.map((item) => {
-    const discountAmount = getShopifyLineItemDiscountAmount(item);
-
     return withoutUndefined({
       item_id: getZohoItemIdForShopifyLineItem(item),
       tax_id: config.zohoDefaultTaxId || undefined,
       name: item.title,
       description: [item.variant_title, `Shopify line item ${item.id}`].filter(Boolean).join(" - "),
       rate: money(item.price),
-      quantity: Number(item.quantity),
-      discount_amount: discountAmount > 0 ? discountAmount : undefined
+      quantity: Number(item.quantity)
     });
   });
-  const hasLineDiscounts = lineItems.some((item) => Number(item.discount_amount ?? 0) > 0);
   const totalDiscount = getShopifyOrderDiscountAmount(order);
   const discountNote = getShopifyDiscountNote(order, totalDiscount);
 
-  return {
+  return withoutUndefined({
     customer_id: customerId,
     date: (order.created_at ?? new Date().toISOString()).slice(0, 10),
     reference_number: order.name ?? String(order.id),
     payment_terms: config.defaultPaymentTerms,
+    discount: totalDiscount > 0 ? totalDiscount : undefined,
+    discount_type: totalDiscount > 0 ? "entity_level" : undefined,
     is_inclusive_tax: config.zohoInclusiveTax,
     is_discount_before_tax: true,
-    discount_type: hasLineDiscounts ? "item_level" : undefined,
     line_items: lineItems,
     shipping_charge: money(order.total_shipping_price_set?.shop_money?.amount ?? 0),
     notes: [
@@ -246,7 +243,7 @@ function mapShopifyOrderToZohoInvoice(order, customerId) {
     ]
       .filter(Boolean)
       .join("\n")
-  };
+  });
 }
 
 function getZohoItemIdForShopifyLineItem(_item) {
