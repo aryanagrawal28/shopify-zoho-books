@@ -8,10 +8,13 @@ Create a Zoho API client and generate a refresh token with offline access. The u
 
 ```text
 ZohoBooks.invoices.CREATE
+ZohoBooks.invoices.READ
 ZohoBooks.contacts.READ
 ZohoBooks.contacts.CREATE
 ZohoBooks.items.READ
 ZohoBooks.settings.READ
+ZohoBooks.creditnotes.CREATE
+ZohoBooks.creditnotes.READ
 ```
 
 Find your Zoho Books organization ID from Zoho Books or the Organizations API, then copy `.env.example` to `.env` and fill in the Zoho values.
@@ -28,10 +31,27 @@ India: ZOHO_API_DOMAIN=https://www.zohoapis.in
 
 ## 2. Configure Shopify
 
-Create a Shopify app or use an existing custom app. Subscribe to the `orders/create` webhook and point it to:
+Create a Shopify app or use an existing custom app. Subscribe to these webhooks:
+
+```text
+orders/create
+orders/updated
+orders/cancelled
+refunds/create
+```
+
+Point each webhook to:
 
 ```text
 https://YOUR_DOMAIN/webhooks/shopify/orders-create
+```
+
+The path can use the event name for clarity, for example:
+
+```text
+https://YOUR_DOMAIN/webhooks/shopify/orders-updated
+https://YOUR_DOMAIN/webhooks/shopify/orders-cancelled
+https://YOUR_DOMAIN/webhooks/shopify/refunds-create
 ```
 
 Set `SHOPIFY_WEBHOOK_SECRET` to your Shopify app client secret. This service verifies `X-Shopify-Hmac-SHA256` before processing the order.
@@ -45,6 +65,8 @@ Zoho invoice line items need a Zoho `item_id`. The starter uses `ZOHO_DEFAULT_IT
 Shopify order discounts are sent to Zoho as an invoice-level discount so the Zoho invoice total matches the Shopify paid total. Discount codes and discount application details are added to the Zoho invoice notes.
 
 By default, `ZOHO_INCLUSIVE_TAX=true`, so Shopify prices are treated as GST-inclusive. For example, a ₹100 Shopify line with 5% GST remains ₹100 total in Zoho, with tax calculated inside that price instead of being added on top.
+
+Shopify refunds create Zoho credit notes and apply them to the original invoice. Shopify cancellations void the original Zoho invoice. The app finds the original invoice using the Shopify order number saved as Zoho `reference_number`.
 
 ## 4. Run locally
 
