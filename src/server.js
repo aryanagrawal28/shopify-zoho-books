@@ -18,6 +18,7 @@ const config = {
 };
 
 const processedWebhookIds = new Set();
+const shopifyOrderInvoiceCache = new Map();
 
 const server = http.createServer(async (req, res) => {
   log("Incoming request", {
@@ -33,7 +34,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  if (req.method !== "POST" || req.url !== "/webhooks/shopify/orders-create") {
+  if (req.method !== "POST" || !req.url?.startsWith("/webhooks/shopify/")) {
     sendJson(res, 404, { error: "Not found" });
     return;
   }
@@ -71,24 +72,32 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  log("Accepted Shopify order webhook", {
+  const topic = req.headers["x-shopify-topic"];
+
+  log("Accepted Shopify webhook", {
     webhookId,
-    orderId: order.id,
-    orderName: order.name,
-    email: order.email ?? order.customer?.email
+    topic,
+    resourceId: order.id,
+    orderId: order.order_id ?? order.id,
+    orderName: order.name ?? order.order_name ?? order.order?.name,
+    email: order.email ?? order.customer?.email ?? order.order?.email
   });
 
   sendJson(res, 200, { ok: true });
 
-  processShopifyOrder(order).catch((error) => {
-    console.error("Failed to create Zoho invoice", {
-      shopifyOrderId: order.id,
-      orderName: order.name,
+  processShopifyWebhook(topic, order).catch((error) => {
+    console.error("Failed to process Shopify webhook", {
+      topic,
+      shopifyResourceId: order.id,
+      shopifyOrderId: order.order_id ?? order.id,
+      orderName: order.name ?? order.order_name ?? order.order?.name,
       error
     });
-    log("Failed to create Zoho invoice", {
-      shopifyOrderId: order.id,
-      orderName: order.name,
+    log("Failed to process Shopify webhook", {
+      topic,
+      shopifyResourceId: order.id,
+      shopifyOrderId: order.order_id ?? order.id,
+      orderName: order.name ?? order.order_name ?? order.order?.name,
       error: error.message
     });
   });
@@ -109,11 +118,39 @@ server.listen(config.port, () => {
   });
 });
 
+async function processShopifyWebhook(topic, payload) {
+  if (topic === "orders/create") {
+    await processShopifyOrder(payload);
+    return;
+  }
+
+  if (topic === "orders/cancelled") {
+    await processShopifyOrderCancellation(payload);
+    return;
+  }
+
+  if (topic === "orders/updated") {
+    await processShopifyOrderUpdate(payload);
+    return;
+  }
+
+  if (topic === "refunds/create") {
+    await processShopifyRefund(payload);
+    return;
+  }
+
+  log("Ignored Shopify webhook topic", { topic });
+}
+
 async function processShopifyOrder(order) {
   const accessToken = await getZohoAccessToken();
   const customerId = await findOrCreateZohoCustomer(accessToken, order);
   const invoicePayload = mapShopifyOrderToZohoInvoice(order, customerId);
   const invoice = await createZohoInvoice(accessToken, invoicePayload);
+  cacheShopifyInvoice(order.id, {
+    invoiceId: invoice.invoice?.invoice_id,
+    referenceNumber: invoice.invoice?.reference_number ?? invoicePayload.reference_number
+  });
 
   console.log("Created Zoho invoice", {
     shopifyOrderId: order.id,
@@ -126,6 +163,108 @@ async function processShopifyOrder(order) {
     shopifyOrderName: order.name,
     zohoInvoiceId: invoice.invoice?.invoice_id,
     zohoInvoiceNumber: invoice.invoice?.invoice_number
+  });
+}
+
+async function processShopifyOrderUpdate(order) {
+  if (order.cancelled_at || order.cancel_reason) {
+    await processShopifyOrderCancellation(order);
+    return;
+  }
+
+  const refunds = order.refunds ?? [];
+
+  if (refunds.length === 0) {
+    log("Shopify order update has no refunds to process", {
+      shopifyOrderId: order.id,
+      orderName: order.name
+    });
+    return;
+  }
+
+  for (const refund of refunds) {
+    await processShopifyRefund({ ...refund, order });
+  }
+}
+
+async function processShopifyOrderCancellation(order) {
+  const accessToken = await getZohoAccessToken();
+  const invoice = await findZohoInvoiceForShopifyPayload(accessToken, order);
+
+  if (!invoice) {
+    throw new Error(`Could not find Zoho invoice for cancelled Shopify order ${order.name ?? order.id}`);
+  }
+
+  if (invoice.status === "void") {
+    log("Zoho invoice already void for cancelled Shopify order", {
+      shopifyOrderId: order.id,
+      orderName: order.name,
+      zohoInvoiceId: invoice.invoice_id
+    });
+    return;
+  }
+
+  await voidZohoInvoice(accessToken, invoice.invoice_id);
+  log("Voided Zoho invoice for cancelled Shopify order", {
+    shopifyOrderId: order.id,
+    orderName: order.name,
+    zohoInvoiceId: invoice.invoice_id,
+    zohoInvoiceNumber: invoice.invoice_number
+  });
+}
+
+async function processShopifyRefund(refund) {
+  const refundAmount = getShopifyRefundAmount(refund);
+
+  if (refundAmount <= 0) {
+    log("Shopify refund has no positive amount to credit", {
+      refundId: refund.id,
+      orderId: refund.order_id ?? refund.order?.id
+    });
+    return;
+  }
+
+  const accessToken = await getZohoAccessToken();
+  const invoice = await findZohoInvoiceForShopifyPayload(accessToken, refund.order ?? refund);
+
+  if (!invoice) {
+    throw new Error(`Could not find Zoho invoice for Shopify refund ${refund.id}`);
+  }
+
+  const creditReference = getShopifyRefundReference(refund);
+  const existingCreditNote = await findZohoCreditNoteByReference(accessToken, creditReference);
+
+  if (existingCreditNote) {
+    log("Zoho credit note already exists for Shopify refund", {
+      refundId: refund.id,
+      creditReference,
+      zohoCreditNoteId: existingCreditNote.creditnote_id,
+      zohoCreditNoteNumber: existingCreditNote.creditnote_number
+    });
+    return;
+  }
+
+  const creditAmount = roundMoney(Math.min(refundAmount, money(invoice.balance ?? invoice.total ?? refundAmount)));
+  const creditNote = await createZohoCreditNote(
+    accessToken,
+    mapShopifyRefundToZohoCreditNote(refund, invoice, creditAmount, creditReference)
+  );
+  const creditNoteId = creditNote.creditnote?.creditnote_id;
+
+  if (creditNoteId) {
+    await applyZohoCreditNoteToInvoice(accessToken, creditNoteId, invoice.invoice_id, creditAmount);
+  }
+
+  log("Created Zoho credit note for Shopify refund", {
+    refundId: refund.id,
+    creditReference,
+    refundAmount,
+    appliedAmount: creditAmount,
+    shopifyOrderId: refund.order_id ?? refund.order?.id,
+    orderName: refund.order?.name,
+    zohoInvoiceId: invoice.invoice_id,
+    zohoCreditNoteId: creditNoteId,
+    zohoCreditNoteNumber: creditNote.creditnote?.creditnote_number
   });
 }
 
@@ -211,6 +350,33 @@ async function createZohoInvoice(accessToken, payload) {
   });
 }
 
+async function voidZohoInvoice(accessToken, invoiceId) {
+  return zohoFetch(accessToken, zohoBooksUrl(`/books/v3/invoices/${invoiceId}/status/void`), {
+    method: "POST"
+  });
+}
+
+async function createZohoCreditNote(accessToken, payload) {
+  return zohoFetch(accessToken, zohoBooksUrl("/books/v3/creditnotes"), {
+    method: "POST",
+    body: JSON.stringify(payload)
+  });
+}
+
+async function applyZohoCreditNoteToInvoice(accessToken, creditNoteId, invoiceId, amount) {
+  return zohoFetch(accessToken, zohoBooksUrl(`/books/v3/creditnotes/${creditNoteId}/invoices`), {
+    method: "POST",
+    body: JSON.stringify({
+      invoices: [
+        {
+          invoice_id: invoiceId,
+          amount_applied: amount
+        }
+      ]
+    })
+  });
+}
+
 function mapShopifyOrderToZohoInvoice(order, customerId) {
   const lineItems = order.line_items.map((item) => {
     return withoutUndefined({
@@ -249,6 +415,134 @@ function mapShopifyOrderToZohoInvoice(order, customerId) {
 function getZohoItemIdForShopifyLineItem(_item) {
   // Replace this with a SKU/product/variant lookup once your Zoho item catalog is mapped.
   return config.zohoDefaultItemId;
+}
+
+function mapShopifyRefundToZohoCreditNote(refund, invoice, amount, referenceNumber) {
+  const order = refund.order ?? {};
+
+  return withoutUndefined({
+    customer_id: invoice.customer_id,
+    date: (refund.created_at ?? new Date().toISOString()).slice(0, 10),
+    reference_number: referenceNumber,
+    is_inclusive_tax: config.zohoInclusiveTax,
+    line_items: [
+      withoutUndefined({
+        item_id: config.zohoDefaultItemId,
+        tax_id: config.zohoDefaultTaxId || undefined,
+        name: `Shopify refund ${refund.id}`,
+        description: [`Refund for Shopify order ${order.name ?? refund.order_id ?? invoice.reference_number}`, refund.note]
+          .filter(Boolean)
+          .join(" - "),
+        rate: amount,
+        quantity: 1
+      })
+    ],
+    notes: `Created automatically from Shopify refund ${refund.id} for order ${order.name ?? refund.order_id ?? invoice.reference_number}`
+  });
+}
+
+async function findZohoInvoiceForShopifyPayload(accessToken, payload) {
+  const cached = shopifyOrderInvoiceCache.get(String(payload.order_id ?? payload.id));
+
+  if (cached?.invoiceId) {
+    return getZohoInvoice(accessToken, cached.invoiceId);
+  }
+
+  for (const reference of getShopifyInvoiceReferenceCandidates(payload)) {
+    const invoice = await findZohoInvoiceByReference(accessToken, reference);
+
+    if (invoice) {
+      return invoice;
+    }
+  }
+
+  return null;
+}
+
+async function getZohoInvoice(accessToken, invoiceId) {
+  const body = await zohoFetch(accessToken, zohoBooksUrl(`/books/v3/invoices/${invoiceId}`));
+  return body.invoice ?? null;
+}
+
+async function findZohoInvoiceByReference(accessToken, referenceNumber) {
+  const url = zohoBooksUrl("/books/v3/invoices");
+  url.searchParams.set("search_text", referenceNumber);
+  url.searchParams.set("filter_by", "Status.All");
+  url.searchParams.set("per_page", "20");
+
+  const body = await zohoFetch(accessToken, url);
+  return (
+    body.invoices?.find((invoice) => {
+      return invoice.reference_number === referenceNumber || invoice.reference_number?.includes(referenceNumber);
+    }) ?? null
+  );
+}
+
+async function findZohoCreditNoteByReference(accessToken, referenceNumber) {
+  const url = zohoBooksUrl("/books/v3/creditnotes");
+  url.searchParams.set("search_text", referenceNumber);
+  url.searchParams.set("filter_by", "Status.All");
+  url.searchParams.set("per_page", "20");
+
+  const body = await zohoFetch(accessToken, url);
+  const creditNotes = Array.isArray(body.creditnotes) ? body.creditnotes : body.creditnotes ? [body.creditnotes] : [];
+  return creditNotes.find((creditNote) => creditNote.reference_number === referenceNumber) ?? null;
+}
+
+function getShopifyInvoiceReferenceCandidates(payload) {
+  const order = payload.order ?? {};
+  return uniqueValues([
+    payload.name,
+    payload.order_name,
+    order.name,
+    payload.order_number ? `#${payload.order_number}` : null,
+    order.order_number ? `#${order.order_number}` : null,
+    payload.order_id ? String(payload.order_id) : null,
+    payload.id ? String(payload.id) : null
+  ]);
+}
+
+function getShopifyRefundReference(refund) {
+  return `Shopify refund ${refund.id}`;
+}
+
+function getShopifyRefundAmount(refund) {
+  const transactionAmount = (refund.transactions ?? [])
+    .filter((transaction) => {
+      return !transaction.status || ["success", "processed"].includes(transaction.status);
+    })
+    .reduce((total, transaction) => {
+      return total + money(transaction.amount);
+    }, 0);
+
+  if (transactionAmount > 0) {
+    return roundMoney(transactionAmount);
+  }
+
+  const lineItemAmount = (refund.refund_line_items ?? []).reduce((total, refundLineItem) => {
+    return (
+      total +
+      money(refundLineItem.subtotal_set?.shop_money?.amount ?? refundLineItem.subtotal) +
+      money(refundLineItem.total_tax_set?.shop_money?.amount ?? refundLineItem.total_tax)
+    );
+  }, 0);
+  const adjustmentAmount = (refund.order_adjustments ?? []).reduce((total, adjustment) => {
+    return (
+      total +
+      Math.abs(money(adjustment.amount_set?.shop_money?.amount ?? adjustment.amount)) +
+      Math.abs(money(adjustment.tax_amount_set?.shop_money?.amount ?? adjustment.tax_amount))
+    );
+  }, 0);
+
+  return roundMoney(lineItemAmount + adjustmentAmount);
+}
+
+function cacheShopifyInvoice(orderId, invoice) {
+  if (!orderId || !invoice.invoiceId) {
+    return;
+  }
+
+  shopifyOrderInvoiceCache.set(String(orderId), invoice);
 }
 
 async function zohoFetch(accessToken, url, options = {}) {
@@ -373,6 +667,10 @@ function roundMoney(value) {
 
 function withoutUndefined(object) {
   return Object.fromEntries(Object.entries(object).filter(([, value]) => value !== undefined));
+}
+
+function uniqueValues(values) {
+  return [...new Set(values.filter(Boolean).map(String))];
 }
 
 function sendJson(res, statusCode, body) {
