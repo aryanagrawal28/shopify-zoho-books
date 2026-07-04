@@ -233,7 +233,7 @@ function mapShopifyOrderToZohoInvoice(order, customerId) {
     discount: totalDiscount > 0 ? totalDiscount : undefined,
     discount_type: totalDiscount > 0 ? "entity_level" : undefined,
     is_inclusive_tax: config.zohoInclusiveTax,
-    is_discount_before_tax: true,
+    is_discount_before_tax: false,
     line_items: lineItems,
     shipping_charge: money(order.total_shipping_price_set?.shop_money?.amount ?? 0),
     notes: [
