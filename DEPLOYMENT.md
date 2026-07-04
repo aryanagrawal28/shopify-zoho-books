@@ -30,13 +30,18 @@ It should return:
 {"ok":true}
 ```
 
-5. Update Shopify's `Order creation` webhook URL:
+5. Update Shopify's webhook URLs:
 
 ```text
-https://YOUR_PRODUCTION_DOMAIN/webhooks/shopify/orders-create
+Order creation:      https://YOUR_PRODUCTION_DOMAIN/webhooks/shopify/orders-create
+Order updated:       https://YOUR_PRODUCTION_DOMAIN/webhooks/shopify/orders-updated
+Order cancellation:  https://YOUR_PRODUCTION_DOMAIN/webhooks/shopify/orders-cancelled
+Refund creation:     https://YOUR_PRODUCTION_DOMAIN/webhooks/shopify/refunds-create
 ```
 
 6. Create one test order and confirm Zoho Books creates an invoice.
+7. Create one partial refund and confirm Zoho Books creates/applies a credit note.
+8. Cancel one test order and confirm Zoho Books voids the invoice.
 
 ## Required Environment Variables
 
@@ -52,6 +57,7 @@ ZOHO_ORGANIZATION_ID=
 ZOHO_DEFAULT_ITEM_ID=
 ZOHO_DEFAULT_TAX_ID=
 ZOHO_DEFAULT_PAYMENT_TERMS=0
+ZOHO_INCLUSIVE_TAX=true
 ```
 
 ## Render Option
@@ -67,10 +73,13 @@ ZOHO_DEFAULT_PAYMENT_TERMS=0
 https://YOUR_RENDER_SERVICE.onrender.com/health
 ```
 
-7. Update Shopify's `Order creation` webhook URL:
+7. Update Shopify's webhook URLs:
 
 ```text
-https://YOUR_RENDER_SERVICE.onrender.com/webhooks/shopify/orders-create
+Order creation:      https://YOUR_RENDER_SERVICE.onrender.com/webhooks/shopify/orders-create
+Order updated:       https://YOUR_RENDER_SERVICE.onrender.com/webhooks/shopify/orders-updated
+Order cancellation:  https://YOUR_RENDER_SERVICE.onrender.com/webhooks/shopify/orders-cancelled
+Refund creation:     https://YOUR_RENDER_SERVICE.onrender.com/webhooks/shopify/refunds-create
 ```
 
 ## VPS Option
@@ -91,5 +100,5 @@ Put Nginx or another reverse proxy in front of the app so Shopify can reach it a
 - Do not use localtunnel for production.
 - Render Free web services spin down after idle time, so use it for testing or low-stakes automation. For truly continuous webhook reliability, use a paid always-on instance or a VPS.
 - Do not commit `.env`.
-- Keep only one Shopify `orders/create` webhook active for this service to avoid duplicate invoices.
+- Keep only one Shopify webhook per topic active for this service to avoid duplicate invoices or duplicate credit notes.
 - If you regenerate any secret/token, update the production environment and restart the app.
