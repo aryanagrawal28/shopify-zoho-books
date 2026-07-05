@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 
-const APP_VERSION = "invoice-place-of-supply-v7-line-discounts";
+const APP_VERSION = "invoice-place-of-supply-v8-tax-rate-tolerance";
 
 const config = {
   port: Number(process.env.PORT ?? 3000),
@@ -554,7 +554,7 @@ async function getZohoTaxIdForShopifyTaxLines(accessToken, order, taxLines, sour
 
   const taxSpecification = isInterstateShopifyOrder(order, taxCatalog.organizationStateCode) ? "inter" : "intra";
   const matchingTax = taxCatalog.taxes.find((tax) => {
-    return tax.tax_specification === taxSpecification && roundMoney(money(tax.tax_percentage)) === taxRate;
+    return tax.tax_specification === taxSpecification && isCloseTaxRate(tax.tax_percentage, taxRate);
   });
 
   if (matchingTax) {
@@ -591,6 +591,10 @@ function getZohoTaxRateById(taxes, taxId) {
 
   const matchingTax = taxes.find((tax) => String(tax.tax_id) === String(taxId));
   return matchingTax ? roundMoney(money(matchingTax.tax_percentage)) : null;
+}
+
+function isCloseTaxRate(zohoTaxPercentage, shopifyTaxRate) {
+  return Math.abs(roundMoney(money(zohoTaxPercentage)) - roundMoney(shopifyTaxRate)) <= 0.1;
 }
 
 function mapShopifyRefundToZohoCreditNote(refund, invoice, amount, referenceNumber) {
