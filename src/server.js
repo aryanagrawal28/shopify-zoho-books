@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 
-const APP_VERSION = "invoice-place-of-supply-v4";
+const APP_VERSION = "invoice-place-of-supply-v5-contact-names";
 
 const config = {
   port: Number(process.env.PORT ?? 3000),
