@@ -2,11 +2,14 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 
-const APP_VERSION = "invoice-v9-shipping-tax-credit-notes";
+const APP_VERSION = "invoice-v10-credit-note-order-lookup";
 
 const config = {
   port: Number(process.env.PORT ?? 3000),
   shopifyWebhookSecret: requiredEnv("SHOPIFY_WEBHOOK_SECRET"),
+  shopifyAdminAccessToken: optionalEnv("SHOPIFY_ADMIN_ACCESS_TOKEN"),
+  shopifyShopDomain: optionalEnv("SHOPIFY_SHOP_DOMAIN"),
+  shopifyApiVersion: optionalEnv("SHOPIFY_API_VERSION", "2026-07"),
   zohoAccountsDomain: optionalEnv("ZOHO_ACCOUNTS_DOMAIN", "https://accounts.zoho.com"),
   zohoApiDomain: optionalEnv("ZOHO_API_DOMAIN", "https://www.zohoapis.com"),
   zohoClientId: requiredEnv("ZOHO_CLIENT_ID"),
@@ -88,7 +91,7 @@ const server = http.createServer(async (req, res) => {
 
   if (req.headers["x-codex-sync"] === "true") {
     try {
-      await processShopifyWebhook(topic, order);
+      await processShopifyWebhook(topic, order, getShopifyWebhookContext(req));
       sendJson(res, 200, { ok: true, processed: true });
     } catch (error) {
       console.error("Failed to process Shopify webhook", {
@@ -112,7 +115,7 @@ const server = http.createServer(async (req, res) => {
 
   sendJson(res, 200, { ok: true });
 
-  processShopifyWebhook(topic, order).catch((error) => {
+  processShopifyWebhook(topic, order, getShopifyWebhookContext(req)).catch((error) => {
     console.error("Failed to process Shopify webhook", {
       topic,
       shopifyResourceId: order.id,
@@ -146,24 +149,30 @@ server.listen(config.port, () => {
   });
 });
 
-async function processShopifyWebhook(topic, payload) {
+function getShopifyWebhookContext(req) {
+  return {
+    shopDomain: req.headers["x-shopify-shop-domain"]
+  };
+}
+
+async function processShopifyWebhook(topic, payload, context = {}) {
   if (topic === "orders/create") {
     await processShopifyOrder(payload);
     return;
   }
 
   if (topic === "orders/cancelled") {
-    await processShopifyOrderCancellation(payload);
+    await processShopifyOrderCancellation(payload, context);
     return;
   }
 
   if (topic === "orders/updated") {
-    await processShopifyOrderUpdate(payload);
+    await processShopifyOrderUpdate(payload, context);
     return;
   }
 
   if (topic === "refunds/create") {
-    await processShopifyRefund(payload);
+    await processShopifyRefund(payload, context);
     return;
   }
 
@@ -194,18 +203,18 @@ async function processShopifyOrder(order) {
   });
 }
 
-async function processShopifyOrderUpdate(order) {
+async function processShopifyOrderUpdate(order, context = {}) {
   const refunds = order.refunds ?? [];
 
   if (order.cancelled_at || order.cancel_reason) {
     if (refunds.length > 0) {
       for (const refund of refunds) {
-        await processShopifyRefund({ ...refund, order });
+        await processShopifyRefund({ ...refund, order }, context);
       }
       return;
     }
 
-    await processShopifyOrderCancellation(order);
+    await processShopifyOrderCancellation(order, context);
     return;
   }
 
@@ -218,16 +227,16 @@ async function processShopifyOrderUpdate(order) {
   }
 
   for (const refund of refunds) {
-    await processShopifyRefund({ ...refund, order });
+    await processShopifyRefund({ ...refund, order }, context);
   }
 }
 
-async function processShopifyOrderCancellation(order) {
+async function processShopifyOrderCancellation(order, context = {}) {
   const refunds = order.refunds ?? [];
 
   if (refunds.length > 0) {
     for (const refund of refunds) {
-      await processShopifyRefund({ ...refund, order });
+      await processShopifyRefund({ ...refund, order }, context);
     }
     return;
   }
@@ -287,7 +296,7 @@ async function processShopifyOrderCancellation(order) {
   });
 }
 
-async function processShopifyRefund(refund) {
+async function processShopifyRefund(refund, context = {}) {
   const refundAmount = getShopifyRefundAmount(refund);
 
   if (refundAmount <= 0) {
@@ -298,11 +307,19 @@ async function processShopifyRefund(refund) {
     return;
   }
 
+  const hydratedOrder = refund.order ?? (await getShopifyOrderForRefund(refund, context));
+  const enrichedRefund = hydratedOrder ? { ...refund, order: hydratedOrder } : refund;
   const accessToken = await getZohoAccessToken();
-  const invoice = await findZohoInvoiceForShopifyPayload(accessToken, refund.order ?? refund);
+  const invoice = await findZohoInvoiceForShopifyPayload(accessToken, enrichedRefund.order ?? enrichedRefund);
 
   if (!invoice) {
-    throw new Error(`Could not find Zoho invoice for Shopify refund ${refund.id}`);
+    throw new Error(
+      `Could not find Zoho invoice for Shopify refund ${refund.id}. ${
+        hydratedOrder
+          ? `Fetched Shopify order ${hydratedOrder.name ?? hydratedOrder.id}, but no matching Zoho invoice was found.`
+          : "Refund payload did not include the Shopify order name, and Shopify Admin API order lookup was unavailable."
+      }`
+    );
   }
 
   const creditReference = getShopifyRefundReference(refund);
@@ -321,7 +338,7 @@ async function processShopifyRefund(refund) {
   const creditAmount = refundAmount;
   const creditNote = await createZohoCreditNote(
     accessToken,
-    mapShopifyRefundToZohoCreditNote(refund, invoice, creditAmount, creditReference)
+    mapShopifyRefundToZohoCreditNote(enrichedRefund, invoice, creditAmount, creditReference)
   );
   const creditNoteId = creditNote.creditnote?.creditnote_id;
   const amountToApply = roundMoney(Math.min(creditAmount, Math.max(money(invoice.balance ?? 0), 0)));
@@ -336,7 +353,7 @@ async function processShopifyRefund(refund) {
     refundAmount,
     appliedAmount: amountToApply,
     shopifyOrderId: refund.order_id ?? refund.order?.id,
-    orderName: refund.order?.name,
+    orderName: enrichedRefund.order?.name,
     zohoInvoiceId: invoice.invoice_id,
     zohoCreditNoteId: creditNoteId,
     zohoCreditNoteNumber: creditNote.creditnote?.creditnote_number
@@ -358,6 +375,53 @@ async function getZohoAccessToken() {
   }
 
   return body.access_token;
+}
+
+async function getShopifyOrderForRefund(refund, context = {}) {
+  const orderId = refund.order_id ?? refund.order?.id;
+
+  if (!orderId || refund.order?.name) {
+    return refund.order ?? null;
+  }
+
+  const shopDomain = normalizeShopifyShopDomain(context.shopDomain ?? config.shopifyShopDomain);
+
+  if (!config.shopifyAdminAccessToken || !shopDomain) {
+    log("Skipping Shopify order lookup for refund because Admin API config is missing", {
+      refundId: refund.id,
+      orderId,
+      hasShopifyAdminAccessToken: Boolean(config.shopifyAdminAccessToken),
+      hasShopDomain: Boolean(shopDomain)
+    });
+    return null;
+  }
+
+  const url = new URL(`/admin/api/${config.shopifyApiVersion}/orders/${orderId}.json`, `https://${shopDomain}`);
+  const response = await fetch(url, {
+    headers: {
+      "X-Shopify-Access-Token": config.shopifyAdminAccessToken,
+      "Content-Type": "application/json"
+    }
+  });
+  const body = await response.json().catch(() => ({}));
+
+  if (!response.ok || !body.order) {
+    log("Failed to fetch Shopify order for refund", {
+      refundId: refund.id,
+      orderId,
+      shopDomain,
+      status: response.status,
+      body
+    });
+    return null;
+  }
+
+  log("Fetched Shopify order for refund lookup", {
+    refundId: refund.id,
+    orderId,
+    orderName: body.order.name
+  });
+  return body.order;
 }
 
 async function findOrCreateZohoCustomer(accessToken, order) {
@@ -1075,6 +1139,15 @@ function getShopifyOrderStateCode(order) {
       order.billing_address?.province_code ??
       order.billing_address?.province
   );
+}
+
+function normalizeShopifyShopDomain(value) {
+  const normalized = String(value ?? "")
+    .trim()
+    .replace(/^https?:\/\//i, "")
+    .replace(/\/.*$/, "");
+
+  return normalized || "";
 }
 
 function normalizeCountryCode(value) {

@@ -56,6 +56,8 @@ https://YOUR_DOMAIN/webhooks/shopify/refunds-create
 
 Set `SHOPIFY_WEBHOOK_SECRET` to your Shopify app client secret. This service verifies `X-Shopify-Hmac-SHA256` before processing the order.
 
+For reliable `refunds/create` handling, also set `SHOPIFY_ADMIN_ACCESS_TOKEN` and `SHOPIFY_SHOP_DOMAIN` in Render. Shopify refund webhooks can arrive with only `order_id`; the Admin API token lets the app fetch the Shopify order name (for example `#6480`) and match the original Zoho invoice.
+
 ## 3. Map Shopify products to Zoho items
 
 Edit `mapShopifyOrderToZohoInvoice` in `src/server.js`.
