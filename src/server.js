@@ -361,7 +361,7 @@ async function createZohoContact(accessToken, order) {
   const phone = billing.phone ?? shipping.phone ?? order.phone ?? customer.phone;
 
   const payload = {
-    contact_name: [firstName, lastName].filter(Boolean).join(" ") || email || `Shopify Customer ${order.id}`,
+    contact_name: getZohoContactName(firstName, lastName, email, order.id),
     contact_type: "customer",
     customer_sub_type: "individual",
     currency_code: order.currency,
@@ -383,6 +383,16 @@ async function createZohoContact(accessToken, order) {
     method: "POST",
     body: JSON.stringify(payload)
   });
+}
+
+function getZohoContactName(firstName, lastName, email, orderId) {
+  const name = [firstName, lastName].filter(Boolean).join(" ");
+
+  if (email) {
+    return name ? `${name} - ${email}` : email;
+  }
+
+  return name || `Shopify Customer ${orderId}`;
 }
 
 async function createZohoInvoice(accessToken, payload) {
