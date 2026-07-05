@@ -2,6 +2,8 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 
+const APP_VERSION = "invoice-place-of-supply-v4";
+
 const config = {
   port: Number(process.env.PORT ?? 3000),
   shopifyWebhookSecret: requiredEnv("SHOPIFY_WEBHOOK_SECRET"),
@@ -19,6 +21,7 @@ const config = {
 
 const processedWebhookIds = new Set();
 const shopifyOrderInvoiceCache = new Map();
+let zohoTaxCatalogPromise;
 
 const server = http.createServer(async (req, res) => {
   log("Incoming request", {
@@ -30,7 +33,7 @@ const server = http.createServer(async (req, res) => {
   });
 
   if (req.method === "GET" && req.url === "/health") {
-    sendJson(res, 200, { ok: true });
+    sendJson(res, 200, { ok: true, version: APP_VERSION });
     return;
   }
 
@@ -83,6 +86,30 @@ const server = http.createServer(async (req, res) => {
     email: order.email ?? order.customer?.email ?? order.order?.email
   });
 
+  if (req.headers["x-codex-sync"] === "true") {
+    try {
+      await processShopifyWebhook(topic, order);
+      sendJson(res, 200, { ok: true, processed: true });
+    } catch (error) {
+      console.error("Failed to process Shopify webhook", {
+        topic,
+        shopifyResourceId: order.id,
+        shopifyOrderId: order.order_id ?? order.id,
+        orderName: order.name ?? order.order_name ?? order.order?.name,
+        error
+      });
+      log("Failed to process Shopify webhook", {
+        topic,
+        shopifyResourceId: order.id,
+        shopifyOrderId: order.order_id ?? order.id,
+        orderName: order.name ?? order.order_name ?? order.order?.name,
+        error: error.message
+      });
+      sendJson(res, 500, { ok: false, error: error.message });
+    }
+    return;
+  }
+
   sendJson(res, 200, { ok: true });
 
   processShopifyWebhook(topic, order).catch((error) => {
@@ -106,6 +133,7 @@ const server = http.createServer(async (req, res) => {
 server.listen(config.port, () => {
   console.log(`Shopify to Zoho Books webhook server listening on :${config.port}`);
   console.log("Loaded config", {
+    version: APP_VERSION,
     zohoAccountsDomain: config.zohoAccountsDomain,
     zohoApiDomain: config.zohoApiDomain,
     zohoClientId: redact(config.zohoClientId),
@@ -145,7 +173,7 @@ async function processShopifyWebhook(topic, payload) {
 async function processShopifyOrder(order) {
   const accessToken = await getZohoAccessToken();
   const customerId = await findOrCreateZohoCustomer(accessToken, order);
-  const invoicePayload = mapShopifyOrderToZohoInvoice(order, customerId);
+  const invoicePayload = await mapShopifyOrderToZohoInvoice(accessToken, order, customerId);
   const invoice = await createZohoInvoice(accessToken, invoicePayload);
   cacheShopifyInvoice(order.id, {
     invoiceId: invoice.invoice?.invoice_id,
@@ -289,10 +317,24 @@ async function findOrCreateZohoCustomer(accessToken, order) {
   const email = order.email ?? order.customer?.email;
 
   if (email) {
-    const existingContact = await findZohoContactByEmail(accessToken, email);
+    const existingContacts = await findZohoContactsByEmail(accessToken, email);
+    const matchingContact = existingContacts.find((contact) => {
+      return doesZohoContactMatchShopifyOrderPlaceOfSupply(contact, order);
+    });
 
-    if (existingContact) {
-      return existingContact.contact_id;
+    if (matchingContact) {
+      return matchingContact.contact_id;
+    }
+
+    if (existingContacts.length > 0) {
+      log("Creating new Zoho contact due to place of supply mismatch", {
+        email,
+        shopifyOrderId: order.id,
+        orderName: order.name,
+        matchedContactIds: existingContacts.map((contact) => contact.contact_id),
+        orderProvinceCode: order.shipping_address?.province_code ?? order.billing_address?.province_code ?? null,
+        orderCountryCode: order.shipping_address?.country_code ?? order.billing_address?.country_code ?? null
+      });
     }
   }
 
@@ -300,13 +342,13 @@ async function findOrCreateZohoCustomer(accessToken, order) {
   return contact.contact.contact_id;
 }
 
-async function findZohoContactByEmail(accessToken, email) {
+async function findZohoContactsByEmail(accessToken, email) {
   const url = zohoBooksUrl("/books/v3/contacts");
   url.searchParams.set("email", email);
   url.searchParams.set("contact_type", "customer");
 
   const body = await zohoFetch(accessToken, url);
-  return body.contacts?.[0] ?? null;
+  return body.contacts ?? [];
 }
 
 async function createZohoContact(accessToken, order) {
@@ -377,29 +419,46 @@ async function applyZohoCreditNoteToInvoice(accessToken, creditNoteId, invoiceId
   });
 }
 
-function mapShopifyOrderToZohoInvoice(order, customerId) {
-  const lineItems = order.line_items.map((item) => {
+async function mapShopifyOrderToZohoInvoice(accessToken, order, customerId) {
+  const totalDiscount = getShopifyOrderDiscountAmount(order);
+  const lineItemsSource = order.line_items ?? [];
+  const baseOrderTotal = lineItemsSource.reduce((total, item) => {
+    return total + money(item.price) * Math.max(Number(item.quantity) || 0, 1);
+  }, 0);
+  const allocatedLineItemDiscountTotal = roundMoney(
+    lineItemsSource.reduce((total, item) => {
+      return total + getShopifyLineItemDiscountAmount(item);
+    }, 0)
+  );
+  const remainingOrderDiscount = roundMoney(Math.max(totalDiscount - allocatedLineItemDiscountTotal, 0));
+  const lineItems = await Promise.all(lineItemsSource.map(async (item) => {
+    const quantity = Math.max(Number(item.quantity) || 0, 1);
+    const baseLineTotal = money(item.price) * quantity;
+    const proportionalOrderDiscount = baseOrderTotal > 0 ? (remainingOrderDiscount * baseLineTotal) / baseOrderTotal : 0;
+    const lineDiscount = Math.min(
+      roundMoney(getShopifyLineItemDiscountAmount(item) + proportionalOrderDiscount),
+      baseLineTotal
+    );
+    const effectiveRate = roundMoney(Math.max(baseLineTotal - lineDiscount, 0) / quantity);
+
     return withoutUndefined({
       item_id: getZohoItemIdForShopifyLineItem(item),
-      tax_id: config.zohoDefaultTaxId || undefined,
+      tax_id: (await getZohoTaxIdForShopifyLineItem(accessToken, order, item)) || undefined,
       name: item.title,
       description: [item.variant_title, `Shopify line item ${item.id}`].filter(Boolean).join(" - "),
-      rate: money(item.price),
-      quantity: Number(item.quantity)
+      rate: effectiveRate,
+      quantity
     });
-  });
-  const totalDiscount = getShopifyOrderDiscountAmount(order);
+  }));
   const discountNote = getShopifyDiscountNote(order, totalDiscount);
 
   return withoutUndefined({
     customer_id: customerId,
     date: (order.created_at ?? new Date().toISOString()).slice(0, 10),
     reference_number: order.name ?? String(order.id),
+    place_of_supply: getShopifyOrderStateCode(order) || undefined,
     payment_terms: config.defaultPaymentTerms,
-    discount: totalDiscount > 0 ? totalDiscount : undefined,
-    discount_type: totalDiscount > 0 ? "entity_level" : undefined,
     is_inclusive_tax: config.zohoInclusiveTax,
-    is_discount_before_tax: false,
     line_items: lineItems,
     shipping_charge: money(order.total_shipping_price_set?.shop_money?.amount ?? 0),
     notes: [
@@ -415,6 +474,57 @@ function mapShopifyOrderToZohoInvoice(order, customerId) {
 function getZohoItemIdForShopifyLineItem(_item) {
   // Replace this with a SKU/product/variant lookup once your Zoho item catalog is mapped.
   return config.zohoDefaultItemId;
+}
+
+async function getZohoTaxIdForShopifyLineItem(accessToken, order, item) {
+  const defaultTaxId = config.zohoDefaultTaxId || null;
+  const taxCatalog = await getZohoTaxCatalog(accessToken);
+  const taxRate =
+    getShopifyTaxRateForLineItem(item) ??
+    getShopifyTaxRateForOrder(order) ??
+    getZohoTaxRateById(taxCatalog.taxes, defaultTaxId);
+
+  if (taxRate === null) {
+    return defaultTaxId;
+  }
+
+  const taxSpecification = isInterstateShopifyOrder(order, taxCatalog.organizationStateCode) ? "inter" : "intra";
+  const matchingTax = taxCatalog.taxes.find((tax) => {
+    return tax.tax_specification === taxSpecification && roundMoney(money(tax.tax_percentage)) === taxRate;
+  });
+
+  if (matchingTax) {
+    log("Selected Zoho tax for Shopify line item", {
+      orderName: order.name,
+      shopifyOrderId: order.id,
+      itemId: item.id,
+      selectedTaxId: matchingTax.tax_id,
+      selectedTaxName: matchingTax.tax_name,
+      selectedTaxRate: matchingTax.tax_percentage,
+      selectedTaxSpecification: taxSpecification
+    });
+    return matchingTax.tax_id;
+  }
+
+  log("Falling back to default Zoho tax", {
+    orderName: order.name,
+    shopifyOrderId: order.id,
+    itemId: item.id,
+    requestedTaxRate: taxRate,
+    requestedTaxSpecification: taxSpecification,
+    fallbackTaxId: defaultTaxId
+  });
+
+  return defaultTaxId;
+}
+
+function getZohoTaxRateById(taxes, taxId) {
+  if (!taxId) {
+    return null;
+  }
+
+  const matchingTax = taxes.find((tax) => String(tax.tax_id) === String(taxId));
+  return matchingTax ? roundMoney(money(matchingTax.tax_percentage)) : null;
 }
 
 function mapShopifyRefundToZohoCreditNote(refund, invoice, amount, referenceNumber) {
@@ -564,6 +674,32 @@ async function zohoFetch(accessToken, url, options = {}) {
   return body;
 }
 
+async function getZohoTaxCatalog(accessToken) {
+  if (!zohoTaxCatalogPromise) {
+    zohoTaxCatalogPromise = loadZohoTaxCatalog(accessToken).catch((error) => {
+      zohoTaxCatalogPromise = undefined;
+      throw error;
+    });
+  }
+
+  return zohoTaxCatalogPromise;
+}
+
+async function loadZohoTaxCatalog(accessToken) {
+  const [organizationsBody, taxesBody] = await Promise.all([
+    zohoFetch(accessToken, new URL("/books/v3/organizations", config.zohoApiDomain)),
+    zohoFetch(accessToken, zohoBooksUrl("/books/v3/settings/taxes"))
+  ]);
+  const organization = (organizationsBody.organizations ?? []).find((candidate) => {
+    return String(candidate.organization_id) === String(config.zohoOrganizationId);
+  });
+
+  return {
+    organizationStateCode: organization?.state_code ?? "",
+    taxes: (taxesBody.taxes ?? []).filter((tax) => !tax.is_inactive)
+  };
+}
+
 function zohoBooksUrl(pathname) {
   const url = new URL(pathname, config.zohoApiDomain);
   url.searchParams.set("organization_id", config.zohoOrganizationId);
@@ -592,17 +728,38 @@ function readRawBody(req) {
 }
 
 function mapAddress(address) {
+  const normalizedStateCode = normalizeIndianStateCode(address.province_code ?? address.province);
+
   return {
     attention: [address.first_name, address.last_name].filter(Boolean).join(" "),
     address: address.address1,
     street2: address.address2,
     city: address.city,
     state: address.province,
-    state_code: address.province_code,
+    state_code: normalizedStateCode || address.province_code,
     zip: address.zip,
     country: address.country,
     phone: address.phone
   };
+}
+
+function doesZohoContactMatchShopifyOrderPlaceOfSupply(contact, order) {
+  const orderCountryCode = normalizeCountryCode(order.shipping_address?.country_code ?? order.billing_address?.country_code);
+  const orderProvinceCode = getShopifyOrderStateCode(order);
+
+  if (orderCountryCode && orderCountryCode !== "IN") {
+    return normalizeCountryCode(contact.country_code) === orderCountryCode;
+  }
+
+  if (!orderProvinceCode) {
+    return true;
+  }
+
+  return (
+    normalizeIndianStateCode(contact.place_of_contact) === orderProvinceCode ||
+    normalizeIndianStateCode(contact.billing_address?.state_code ?? contact.billing_address?.state) === orderProvinceCode ||
+    normalizeIndianStateCode(contact.shipping_address?.state_code ?? contact.shipping_address?.state) === orderProvinceCode
+  );
 }
 
 function getShopifyLineItemDiscountAmount(item) {
@@ -615,6 +772,30 @@ function getShopifyLineItemDiscountAmount(item) {
   }
 
   return roundMoney(money(item.total_discount_set?.shop_money?.amount ?? item.total_discount));
+}
+
+function getShopifyTaxRateForLineItem(item) {
+  const taxRate = (item.tax_lines ?? []).reduce((total, taxLine) => {
+    return total + Number(taxLine.rate ?? 0);
+  }, 0);
+
+  if (taxRate > 0) {
+    return roundMoney(taxRate * 100);
+  }
+
+  return null;
+}
+
+function getShopifyTaxRateForOrder(order) {
+  const orderLevelTaxRate = (order.tax_lines ?? []).reduce((total, taxLine) => {
+    return total + Number(taxLine.rate ?? 0);
+  }, 0);
+
+  if (orderLevelTaxRate > 0) {
+    return roundMoney(orderLevelTaxRate * 100);
+  }
+
+  return null;
 }
 
 function getShopifyOrderDiscountAmount(order) {
@@ -654,6 +835,47 @@ function getShopifyDiscountNote(order, totalDiscount) {
   return [`Shopify discount total: ${totalDiscount}`, details.length ? `Discount details: ${details.join(", ")}` : null]
     .filter(Boolean)
     .join("\n");
+}
+
+function isInterstateShopifyOrder(order, organizationStateCode) {
+  const shipping = order.shipping_address ?? {};
+  const billing = order.billing_address ?? {};
+  const destinationCountryCode = normalizeCountryCode(shipping.country_code ?? billing.country_code);
+  const destinationStateCode = getShopifyOrderStateCode(order);
+  const normalizedOrganizationStateCode = normalizeIndianStateCode(organizationStateCode);
+
+  if (destinationCountryCode && destinationCountryCode !== "IN") {
+    return true;
+  }
+
+  if (!destinationStateCode || !normalizedOrganizationStateCode) {
+    return false;
+  }
+
+  return destinationStateCode !== normalizedOrganizationStateCode;
+}
+
+function getShopifyOrderStateCode(order) {
+  return normalizeIndianStateCode(
+    order.shipping_address?.province_code ??
+      order.shipping_address?.province ??
+      order.billing_address?.province_code ??
+      order.billing_address?.province
+  );
+}
+
+function normalizeCountryCode(value) {
+  return String(value ?? "").trim().toUpperCase();
+}
+
+function normalizeIndianStateCode(value) {
+  const normalized = String(value ?? "").trim().toUpperCase();
+
+  if (!normalized) {
+    return "";
+  }
+
+  return INDIAN_STATE_CODES[normalized] ?? normalized;
 }
 
 function money(value) {
@@ -718,3 +940,48 @@ function redact(value) {
 
   return `${value.slice(0, 5)}...${value.slice(-4)} (${value.length} chars)`;
 }
+
+const INDIAN_STATE_CODES = {
+  "ANDAMAN AND NICOBAR ISLANDS": "AN",
+  "ANDHRA PRADESH": "AP",
+  "ARUNACHAL PRADESH": "AR",
+  ASSAM: "AS",
+  BIHAR: "BR",
+  CHANDIGARH: "CH",
+  CHHATTISGARH: "CG",
+  DADRA: "DN",
+  "DADRA AND NAGAR HAVELI": "DN",
+  DAMAN: "DD",
+  "DAMAN AND DIU": "DD",
+  DELHI: "DL",
+  "NCT OF DELHI": "DL",
+  GOA: "GA",
+  GUJARAT: "GJ",
+  HARYANA: "HR",
+  "HIMACHAL PRADESH": "HP",
+  "JAMMU AND KASHMIR": "JK",
+  JHARKHAND: "JH",
+  KARNATAKA: "KA",
+  KERALA: "KL",
+  LADAKH: "LA",
+  LAKSHADWEEP: "LD",
+  "MADHYA PRADESH": "MP",
+  MAHARASHTRA: "MH",
+  MANIPUR: "MN",
+  MEGHALAYA: "ML",
+  MIZORAM: "MZ",
+  NAGALAND: "NL",
+  ODISHA: "OR",
+  ORISSA: "OR",
+  PUDUCHERRY: "PY",
+  PONDICHERRY: "PY",
+  PUNJAB: "PB",
+  RAJASTHAN: "RJ",
+  SIKKIM: "SK",
+  "TAMIL NADU": "TN",
+  TELANGANA: "TS",
+  TRIPURA: "TR",
+  "UTTAR PRADESH": "UP",
+  UTTARAKHAND: "UK",
+  "WEST BENGAL": "WB"
+};
