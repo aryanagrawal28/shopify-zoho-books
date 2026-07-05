@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 
-const APP_VERSION = "invoice-v11-webhook-only-credit-notes";
+const APP_VERSION = "invoice-v12-credit-note-apply-spec";
 
 const config = {
   port: Number(process.env.PORT ?? 3000),
@@ -481,6 +481,8 @@ async function applyZohoCreditNoteToInvoice(accessToken, creditNoteId, invoiceId
   return zohoFetch(accessToken, zohoBooksUrl(`/books/v3/creditnotes/${creditNoteId}/invoices`), {
     method: "POST",
     body: JSON.stringify({
+      invoice_id: invoiceId,
+      amount_applied: amount,
       invoices: [
         {
           invoice_id: invoiceId,
