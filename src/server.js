@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 
-const APP_VERSION = "invoice-place-of-supply-v6-shopify-tax-amounts";
+const APP_VERSION = "invoice-place-of-supply-v7-line-discounts";
 
 const config = {
   port: Number(process.env.PORT ?? 3000),
@@ -450,7 +450,6 @@ async function mapShopifyOrderToZohoInvoice(accessToken, order, customerId) {
       roundMoney(getShopifyLineItemDiscountAmount(item) + proportionalOrderDiscount),
       baseLineTotal
     );
-    const effectiveRate = roundMoney(Math.max(baseLineTotal - lineDiscount, 0) / quantity);
     const lineTaxAmount = getShopifyLineItemTaxAmount(item);
 
     return withoutUndefined({
@@ -458,7 +457,8 @@ async function mapShopifyOrderToZohoInvoice(accessToken, order, customerId) {
       tax_id: lineTaxAmount > 0 ? (await getZohoTaxIdForShopifyLineItem(accessToken, order, item)) || undefined : undefined,
       name: item.title,
       description: [item.variant_title, `Shopify line item ${item.id}`].filter(Boolean).join(" - "),
-      rate: effectiveRate,
+      rate: money(item.price),
+      discount: lineDiscount > 0 ? lineDiscount : undefined,
       quantity
     });
   }));
@@ -472,6 +472,7 @@ async function mapShopifyOrderToZohoInvoice(accessToken, order, customerId) {
     place_of_supply: getShopifyOrderStateCode(order) || undefined,
     payment_terms: config.defaultPaymentTerms,
     is_inclusive_tax: config.zohoInclusiveTax,
+    is_discount_before_tax: true,
     line_items: [...lineItems, ...shippingLineItems],
     shipping_charge: shippingLineItems.length > 0 ? undefined : getShopifyShippingTotal(order),
     notes: [
