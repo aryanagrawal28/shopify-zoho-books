@@ -2,14 +2,11 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 
-const APP_VERSION = "invoice-v10-credit-note-order-lookup";
+const APP_VERSION = "invoice-v11-webhook-only-credit-notes";
 
 const config = {
   port: Number(process.env.PORT ?? 3000),
   shopifyWebhookSecret: requiredEnv("SHOPIFY_WEBHOOK_SECRET"),
-  shopifyAdminAccessToken: optionalEnv("SHOPIFY_ADMIN_ACCESS_TOKEN"),
-  shopifyShopDomain: optionalEnv("SHOPIFY_SHOP_DOMAIN"),
-  shopifyApiVersion: optionalEnv("SHOPIFY_API_VERSION", "2026-07"),
   zohoAccountsDomain: optionalEnv("ZOHO_ACCOUNTS_DOMAIN", "https://accounts.zoho.com"),
   zohoApiDomain: optionalEnv("ZOHO_API_DOMAIN", "https://www.zohoapis.com"),
   zohoClientId: requiredEnv("ZOHO_CLIENT_ID"),
@@ -307,19 +304,20 @@ async function processShopifyRefund(refund, context = {}) {
     return;
   }
 
-  const hydratedOrder = refund.order ?? (await getShopifyOrderForRefund(refund, context));
-  const enrichedRefund = hydratedOrder ? { ...refund, order: hydratedOrder } : refund;
+  const enrichedRefund = refund;
   const accessToken = await getZohoAccessToken();
   const invoice = await findZohoInvoiceForShopifyPayload(accessToken, enrichedRefund.order ?? enrichedRefund);
 
   if (!invoice) {
-    throw new Error(
-      `Could not find Zoho invoice for Shopify refund ${refund.id}. ${
-        hydratedOrder
-          ? `Fetched Shopify order ${hydratedOrder.name ?? hydratedOrder.id}, but no matching Zoho invoice was found.`
-          : "Refund payload did not include the Shopify order name, and Shopify Admin API order lookup was unavailable."
-      }`
-    );
+    if (!hasShopifyOrderNameReference(enrichedRefund.order ?? enrichedRefund)) {
+      log("Shopify refund webhook missing order name; waiting for orders/updated webhook", {
+        refundId: refund.id,
+        orderId: refund.order_id ?? refund.order?.id
+      });
+      return;
+    }
+
+    throw new Error(`Could not find Zoho invoice for Shopify refund ${refund.id}`);
   }
 
   const creditReference = getShopifyRefundReference(refund);
@@ -375,53 +373,6 @@ async function getZohoAccessToken() {
   }
 
   return body.access_token;
-}
-
-async function getShopifyOrderForRefund(refund, context = {}) {
-  const orderId = refund.order_id ?? refund.order?.id;
-
-  if (!orderId || refund.order?.name) {
-    return refund.order ?? null;
-  }
-
-  const shopDomain = normalizeShopifyShopDomain(context.shopDomain ?? config.shopifyShopDomain);
-
-  if (!config.shopifyAdminAccessToken || !shopDomain) {
-    log("Skipping Shopify order lookup for refund because Admin API config is missing", {
-      refundId: refund.id,
-      orderId,
-      hasShopifyAdminAccessToken: Boolean(config.shopifyAdminAccessToken),
-      hasShopDomain: Boolean(shopDomain)
-    });
-    return null;
-  }
-
-  const url = new URL(`/admin/api/${config.shopifyApiVersion}/orders/${orderId}.json`, `https://${shopDomain}`);
-  const response = await fetch(url, {
-    headers: {
-      "X-Shopify-Access-Token": config.shopifyAdminAccessToken,
-      "Content-Type": "application/json"
-    }
-  });
-  const body = await response.json().catch(() => ({}));
-
-  if (!response.ok || !body.order) {
-    log("Failed to fetch Shopify order for refund", {
-      refundId: refund.id,
-      orderId,
-      shopDomain,
-      status: response.status,
-      body
-    });
-    return null;
-  }
-
-  log("Fetched Shopify order for refund lookup", {
-    refundId: refund.id,
-    orderId,
-    orderName: body.order.name
-  });
-  return body.order;
 }
 
 async function findOrCreateZohoCustomer(accessToken, order) {
@@ -822,6 +773,11 @@ function getShopifyInvoiceReferenceCandidates(payload) {
   ]);
 }
 
+function hasShopifyOrderNameReference(payload) {
+  const order = payload.order ?? {};
+  return Boolean(payload.name || payload.order_name || order.name || payload.order_number || order.order_number);
+}
+
 function getShopifyRefundReference(refund) {
   return `Shopify refund ${refund.id}`;
 }
@@ -1139,15 +1095,6 @@ function getShopifyOrderStateCode(order) {
       order.billing_address?.province_code ??
       order.billing_address?.province
   );
-}
-
-function normalizeShopifyShopDomain(value) {
-  const normalized = String(value ?? "")
-    .trim()
-    .replace(/^https?:\/\//i, "")
-    .replace(/\/.*$/, "");
-
-  return normalized || "";
 }
 
 function normalizeCountryCode(value) {
