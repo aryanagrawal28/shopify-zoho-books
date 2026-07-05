@@ -1,3 +1,5 @@
 .env
+.env.*
+!.env.example
 webhook.log
 node_modules/

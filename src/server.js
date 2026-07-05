@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 
-const APP_VERSION = "invoice-place-of-supply-v8-tax-rate-tolerance";
+const APP_VERSION = "invoice-v9-shipping-tax-credit-notes";
 
 const config = {
   port: Number(process.env.PORT ?? 3000),
@@ -195,12 +195,19 @@ async function processShopifyOrder(order) {
 }
 
 async function processShopifyOrderUpdate(order) {
+  const refunds = order.refunds ?? [];
+
   if (order.cancelled_at || order.cancel_reason) {
+    if (refunds.length > 0) {
+      for (const refund of refunds) {
+        await processShopifyRefund({ ...refund, order });
+      }
+      return;
+    }
+
     await processShopifyOrderCancellation(order);
     return;
   }
-
-  const refunds = order.refunds ?? [];
 
   if (refunds.length === 0) {
     log("Shopify order update has no refunds to process", {
@@ -216,6 +223,15 @@ async function processShopifyOrderUpdate(order) {
 }
 
 async function processShopifyOrderCancellation(order) {
+  const refunds = order.refunds ?? [];
+
+  if (refunds.length > 0) {
+    for (const refund of refunds) {
+      await processShopifyRefund({ ...refund, order });
+    }
+    return;
+  }
+
   const accessToken = await getZohoAccessToken();
   const invoice = await findZohoInvoiceForShopifyPayload(accessToken, order);
 
@@ -223,8 +239,24 @@ async function processShopifyOrderCancellation(order) {
     throw new Error(`Could not find Zoho invoice for cancelled Shopify order ${order.name ?? order.id}`);
   }
 
-  if (invoice.status === "void") {
-    log("Zoho invoice already void for cancelled Shopify order", {
+  const creditReference = getShopifyCancellationCreditReference(order);
+  const existingCreditNote = await findZohoCreditNoteByReference(accessToken, creditReference);
+
+  if (existingCreditNote) {
+    log("Zoho cancellation credit note already exists for Shopify order", {
+      shopifyOrderId: order.id,
+      orderName: order.name,
+      creditReference,
+      zohoCreditNoteId: existingCreditNote.creditnote_id,
+      zohoCreditNoteNumber: existingCreditNote.creditnote_number
+    });
+    return;
+  }
+
+  const creditAmount = roundMoney(money(invoice.total ?? invoice.balance ?? 0));
+
+  if (creditAmount <= 0) {
+    log("Zoho invoice has no positive amount to credit for cancelled Shopify order", {
       shopifyOrderId: order.id,
       orderName: order.name,
       zohoInvoiceId: invoice.invoice_id
@@ -232,12 +264,26 @@ async function processShopifyOrderCancellation(order) {
     return;
   }
 
-  await voidZohoInvoice(accessToken, invoice.invoice_id);
-  log("Voided Zoho invoice for cancelled Shopify order", {
+  const creditNote = await createZohoCreditNote(
+    accessToken,
+    mapShopifyCancellationToZohoCreditNote(order, invoice, creditAmount, creditReference)
+  );
+  const creditNoteId = creditNote.creditnote?.creditnote_id;
+  const amountToApply = roundMoney(Math.min(creditAmount, Math.max(money(invoice.balance ?? 0), 0)));
+
+  if (creditNoteId && amountToApply > 0) {
+    await applyZohoCreditNoteToInvoice(accessToken, creditNoteId, invoice.invoice_id, amountToApply);
+  }
+
+  log("Created Zoho credit note for cancelled Shopify order", {
     shopifyOrderId: order.id,
     orderName: order.name,
+    creditReference,
+    creditAmount,
+    appliedAmount: amountToApply,
     zohoInvoiceId: invoice.invoice_id,
-    zohoInvoiceNumber: invoice.invoice_number
+    zohoInvoiceNumber: invoice.invoice_number,
+    zohoCreditNoteNumber: creditNote.creditnote?.creditnote_number
   });
 }
 
@@ -272,22 +318,23 @@ async function processShopifyRefund(refund) {
     return;
   }
 
-  const creditAmount = roundMoney(Math.min(refundAmount, money(invoice.balance ?? invoice.total ?? refundAmount)));
+  const creditAmount = refundAmount;
   const creditNote = await createZohoCreditNote(
     accessToken,
     mapShopifyRefundToZohoCreditNote(refund, invoice, creditAmount, creditReference)
   );
   const creditNoteId = creditNote.creditnote?.creditnote_id;
+  const amountToApply = roundMoney(Math.min(creditAmount, Math.max(money(invoice.balance ?? 0), 0)));
 
-  if (creditNoteId) {
-    await applyZohoCreditNoteToInvoice(accessToken, creditNoteId, invoice.invoice_id, creditAmount);
+  if (creditNoteId && amountToApply > 0) {
+    await applyZohoCreditNoteToInvoice(accessToken, creditNoteId, invoice.invoice_id, amountToApply);
   }
 
   log("Created Zoho credit note for Shopify refund", {
     refundId: refund.id,
     creditReference,
     refundAmount,
-    appliedAmount: creditAmount,
+    appliedAmount: amountToApply,
     shopifyOrderId: refund.order_id ?? refund.order?.id,
     orderName: refund.order?.name,
     zohoInvoiceId: invoice.invoice_id,
@@ -402,14 +449,14 @@ async function createZohoInvoice(accessToken, payload) {
   });
 }
 
-async function voidZohoInvoice(accessToken, invoiceId) {
-  return zohoFetch(accessToken, zohoBooksUrl(`/books/v3/invoices/${invoiceId}/status/void`), {
-    method: "POST"
-  });
-}
-
 async function createZohoCreditNote(accessToken, payload) {
-  return zohoFetch(accessToken, zohoBooksUrl("/books/v3/creditnotes"), {
+  const url = zohoBooksUrl("/books/v3/creditnotes");
+
+  if (payload.invoice_id) {
+    url.searchParams.set("invoice_id", payload.invoice_id);
+  }
+
+  return zohoFetch(accessToken, url, {
     method: "POST",
     body: JSON.stringify(payload)
   });
@@ -431,7 +478,7 @@ async function applyZohoCreditNoteToInvoice(accessToken, creditNoteId, invoiceId
 
 async function mapShopifyOrderToZohoInvoice(accessToken, order, customerId) {
   const totalDiscount = getShopifyOrderDiscountAmount(order);
-  const totalTax = getShopifyOrderTaxAmount(order);
+  const shippingTaxTotal = getShopifyShippingTaxAmount(order);
   const lineItemsSource = order.line_items ?? [];
   const baseOrderTotal = lineItemsSource.reduce((total, item) => {
     return total + money(item.price) * Math.max(Number(item.quantity) || 0, 1);
@@ -450,11 +497,9 @@ async function mapShopifyOrderToZohoInvoice(accessToken, order, customerId) {
       roundMoney(getShopifyLineItemDiscountAmount(item) + proportionalOrderDiscount),
       baseLineTotal
     );
-    const lineTaxAmount = getShopifyLineItemTaxAmount(item);
 
     return withoutUndefined({
       item_id: getZohoItemIdForShopifyLineItem(item),
-      tax_id: lineTaxAmount > 0 ? (await getZohoTaxIdForShopifyLineItem(accessToken, order, item)) || undefined : undefined,
       name: item.title,
       description: [item.variant_title, `Shopify line item ${item.id}`].filter(Boolean).join(" - "),
       rate: money(item.price),
@@ -478,8 +523,8 @@ async function mapShopifyOrderToZohoInvoice(accessToken, order, customerId) {
     notes: [
       `Created automatically from Shopify order ${order.name ?? order.id}`,
       discountNote,
-      totalTax > 0 ? `Shopify tax total: ${totalTax}` : null,
-      config.zohoInclusiveTax ? "Shopify product prices are treated as GST-inclusive." : null
+      shippingTaxTotal > 0 ? `Shopify shipping GST included: ${shippingTaxTotal}` : null,
+      config.zohoInclusiveTax ? "Shopify shipping charges are treated as GST-inclusive. Product lines are not taxed in Zoho." : null
     ]
       .filter(Boolean)
       .join("\n")
@@ -496,9 +541,7 @@ async function mapShopifyShippingLinesToZohoLineItems(accessToken, order) {
 
   if (shippingLines.length === 0) {
     const shippingTotal = getShopifyShippingTotal(order);
-    const productTaxTotal = getShopifyProductTaxAmount(order);
-    const orderTaxTotal = getShopifyOrderTaxAmount(order);
-    const shippingTaxTotal = roundMoney(Math.max(orderTaxTotal - productTaxTotal, 0));
+    const shippingTaxTotal = getShopifyShippingTaxAmount(order);
 
     if (shippingTotal <= 0 || shippingTaxTotal <= 0) {
       return [];
@@ -520,11 +563,12 @@ async function mapShopifyShippingLinesToZohoLineItems(accessToken, order) {
     shippingLines.map(async (shippingLine) => {
       const rate = getShopifyShippingLinePrice(shippingLine);
       const shippingTaxAmount = getShopifyTaxLinesAmount(shippingLine.tax_lines);
+      const shouldApplyShippingTax = shippingTaxAmount > 0 || (shippingLines.length === 1 && getShopifyShippingTaxAmount(order) > 0);
 
       return withoutUndefined({
         item_id: config.zohoDefaultItemId,
         tax_id:
-          shippingTaxAmount > 0
+          shouldApplyShippingTax
             ? (await getZohoTaxIdForShopifyTaxLines(accessToken, order, shippingLine.tax_lines ?? [], "shipping")) || undefined
             : undefined,
         name: shippingLine.title || shippingLine.code || "Shipping Fee",
@@ -534,10 +578,6 @@ async function mapShopifyShippingLinesToZohoLineItems(accessToken, order) {
       });
     })
   );
-}
-
-async function getZohoTaxIdForShopifyLineItem(accessToken, order, item) {
-  return getZohoTaxIdForShopifyTaxLines(accessToken, order, item.tax_lines ?? [], `line item ${item.id}`);
 }
 
 async function getZohoTaxIdForShopifyTaxLines(accessToken, order, taxLines, source) {
@@ -602,13 +642,20 @@ function mapShopifyRefundToZohoCreditNote(refund, invoice, amount, referenceNumb
 
   return withoutUndefined({
     customer_id: invoice.customer_id,
+    invoice_id: invoice.invoice_id,
+    invoices: [
+      {
+        invoice_id: invoice.invoice_id,
+        amount
+      }
+    ],
     date: (refund.created_at ?? new Date().toISOString()).slice(0, 10),
     reference_number: referenceNumber,
     is_inclusive_tax: config.zohoInclusiveTax,
     line_items: [
       withoutUndefined({
         item_id: config.zohoDefaultItemId,
-        tax_id: config.zohoDefaultTaxId || undefined,
+        invoice_id: invoice.invoice_id,
         name: `Shopify refund ${refund.id}`,
         description: [`Refund for Shopify order ${order.name ?? refund.order_id ?? invoice.reference_number}`, refund.note]
           .filter(Boolean)
@@ -618,6 +665,35 @@ function mapShopifyRefundToZohoCreditNote(refund, invoice, amount, referenceNumb
       })
     ],
     notes: `Created automatically from Shopify refund ${refund.id} for order ${order.name ?? refund.order_id ?? invoice.reference_number}`
+  });
+}
+
+function mapShopifyCancellationToZohoCreditNote(order, invoice, amount, referenceNumber) {
+  return withoutUndefined({
+    customer_id: invoice.customer_id,
+    invoice_id: invoice.invoice_id,
+    invoices: [
+      {
+        invoice_id: invoice.invoice_id,
+        amount
+      }
+    ],
+    date: (order.cancelled_at ?? order.updated_at ?? new Date().toISOString()).slice(0, 10),
+    reference_number: referenceNumber,
+    is_inclusive_tax: config.zohoInclusiveTax,
+    line_items: [
+      withoutUndefined({
+        item_id: config.zohoDefaultItemId,
+        invoice_id: invoice.invoice_id,
+        name: `Shopify cancellation ${order.name ?? order.id}`,
+        description: [`Cancellation credit for Shopify order ${order.name ?? order.id}`, order.cancel_reason]
+          .filter(Boolean)
+          .join(" - "),
+        rate: amount,
+        quantity: 1
+      })
+    ],
+    notes: `Created automatically for cancelled Shopify order ${order.name ?? order.id}`
   });
 }
 
@@ -684,6 +760,10 @@ function getShopifyInvoiceReferenceCandidates(payload) {
 
 function getShopifyRefundReference(refund) {
   return `Shopify refund ${refund.id}`;
+}
+
+function getShopifyCancellationCreditReference(order) {
+  return `Shopify cancellation ${order.name ?? order.id}`;
 }
 
 function getShopifyRefundAmount(refund) {
@@ -870,6 +950,18 @@ function getShopifyOrderTaxAmount(order) {
         return total + getShopifyTaxLinesAmount(shippingLine.tax_lines);
       }, 0)
   );
+}
+
+function getShopifyShippingTaxAmount(order) {
+  const shippingTax = (order.shipping_lines ?? []).reduce((total, shippingLine) => {
+    return total + getShopifyTaxLinesAmount(shippingLine.tax_lines);
+  }, 0);
+
+  if (shippingTax > 0) {
+    return roundMoney(shippingTax);
+  }
+
+  return getShopifyShippingTotal(order) > 0 ? getShopifyOrderTaxAmount(order) : 0;
 }
 
 function getShopifyTaxLinesAmount(taxLines = []) {

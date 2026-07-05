@@ -64,9 +64,9 @@ Zoho invoice line items need a Zoho `item_id`. The starter uses `ZOHO_DEFAULT_IT
 
 Shopify order discounts are sent to Zoho as an invoice-level discount so the Zoho invoice total matches the Shopify paid total. Discount codes and discount application details are added to the Zoho invoice notes.
 
-By default, `ZOHO_INCLUSIVE_TAX=true`, so Shopify prices are treated as GST-inclusive. For example, a ₹100 Shopify line with 5% GST remains ₹100 total in Zoho, with tax calculated inside that price instead of being added on top.
+By default, `ZOHO_INCLUSIVE_TAX=true`, so Shopify shipping tax is treated as inclusive while product lines are not taxed again in Zoho. For example, Shopify product totals and discounts stay at the paid Shopify amount, and any Shopify shipping GST is shown inside the shipping charge instead of being added on top.
 
-Shopify refunds create Zoho credit notes and apply them to the original invoice. Shopify cancellations void the original Zoho invoice. The app finds the original invoice using the Shopify order number saved as Zoho `reference_number`.
+Shopify refunds and cancellations create Zoho credit notes associated with the original invoice, preserving the invoice record while deducting the appropriate amount. The app finds the original invoice using the Shopify order number saved as Zoho `reference_number`.
 
 ## 4. Run locally
 
