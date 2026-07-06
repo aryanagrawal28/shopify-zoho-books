@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 
-const APP_VERSION = "invoice-v18-visible-discount-row";
+const APP_VERSION = "invoice-v19-zoho-summary-tax";
 
 const config = {
   port: Number(process.env.PORT ?? 3000),
@@ -551,8 +551,17 @@ function getZohoItemIdForShopifyLineItem(_item) {
 async function getZohoTaxForShopifyTaxLines(accessToken, order, taxLines, source) {
   const defaultTaxId = config.zohoDefaultTaxId || null;
   const taxCatalog = await getZohoTaxCatalog(accessToken);
+  const shopifyTaxRate = getShopifyTaxRateForTaxLines(taxLines);
+
+  if (source === "product" && shopifyTaxRate === null) {
+    return {
+      taxId: null,
+      taxRate: null
+    };
+  }
+
   const taxRate =
-    getShopifyTaxRateForTaxLines(taxLines) ??
+    shopifyTaxRate ??
     getShopifyTaxRateForOrder(order) ??
     getZohoTaxRateById(taxCatalog.taxes, defaultTaxId);
 
