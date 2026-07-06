@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 
-const APP_VERSION = "invoice-v12-credit-note-apply-spec";
+const APP_VERSION = "invoice-v16-visible-shopify-discounts";
 
 const config = {
   port: Number(process.env.PORT ?? 3000),
@@ -180,6 +180,15 @@ async function processShopifyOrder(order) {
   const accessToken = await getZohoAccessToken();
   const customerId = await findOrCreateZohoCustomer(accessToken, order);
   const invoicePayload = await mapShopifyOrderToZohoInvoice(accessToken, order, customerId);
+  log("Prepared Zoho invoice payload", {
+    shopifyOrderId: order.id,
+    shopifyOrderName: order.name,
+    shopifyTotal: getShopifyOrderTotal(order),
+    mappedTotal: getZohoPayloadTotal(invoicePayload),
+    shippingCharge: invoicePayload.shipping_charge ?? 0,
+    adjustment: invoicePayload.adjustment ?? 0,
+    lineItemsTotal: getZohoPayloadLineItemsTotal(invoicePayload)
+  });
   const invoice = await createZohoInvoice(accessToken, invoicePayload);
   cacheShopifyInvoice(order.id, {
     invoiceId: invoice.invoice?.invoice_id,
@@ -495,37 +504,44 @@ async function applyZohoCreditNoteToInvoice(accessToken, creditNoteId, invoiceId
 
 async function mapShopifyOrderToZohoInvoice(accessToken, order, customerId) {
   const totalDiscount = getShopifyOrderDiscountAmount(order);
+  const shippingTotal = getShopifyShippingTotal(order);
   const shippingTaxTotal = getShopifyShippingTaxAmount(order);
   const lineItemsSource = order.line_items ?? [];
+  const shopifyTotal = getShopifyOrderTotal(order);
   const baseOrderTotal = lineItemsSource.reduce((total, item) => {
-    return total + money(item.price) * Math.max(Number(item.quantity) || 0, 1);
+    return total + getShopifyLineItemBaseTotal(item);
   }, 0);
+  const productDiscountTotal = getShopifyProductDiscountTotal(baseOrderTotal, shippingTotal, shopifyTotal, totalDiscount);
   const allocatedLineItemDiscountTotal = roundMoney(
     lineItemsSource.reduce((total, item) => {
       return total + getShopifyLineItemDiscountAmount(item);
     }, 0)
   );
-  const remainingOrderDiscount = roundMoney(Math.max(totalDiscount - allocatedLineItemDiscountTotal, 0));
+  const remainingOrderDiscount = roundMoney(Math.max(productDiscountTotal - allocatedLineItemDiscountTotal, 0));
   const lineItems = await Promise.all(lineItemsSource.map(async (item) => {
     const quantity = Math.max(Number(item.quantity) || 0, 1);
-    const baseLineTotal = money(item.price) * quantity;
+    const baseLineTotal = getShopifyLineItemBaseTotal(item);
     const proportionalOrderDiscount = baseOrderTotal > 0 ? (remainingOrderDiscount * baseLineTotal) / baseOrderTotal : 0;
     const lineDiscount = Math.min(
       roundMoney(getShopifyLineItemDiscountAmount(item) + proportionalOrderDiscount),
       baseLineTotal
     );
+    const discountedLineTotal = roundMoney(baseLineTotal - lineDiscount);
+    const taxDetails = await getZohoTaxForShopifyTaxLines(accessToken, order, item.tax_lines ?? [], "product");
+    const discountDisplay = getShopifyLineItemDiscountDisplay(order, item, lineDiscount);
 
     return withoutUndefined({
       item_id: getZohoItemIdForShopifyLineItem(item),
+      tax_id: taxDetails.taxId || undefined,
       name: item.title,
-      description: [item.variant_title, `Shopify line item ${item.id}`].filter(Boolean).join(" - "),
-      rate: money(item.price),
-      discount: lineDiscount > 0 ? lineDiscount : undefined,
+      description: [item.variant_title, discountDisplay, `Shopify line item ${item.id}`].filter(Boolean).join(" - "),
+      rate: roundMoney(discountedLineTotal / quantity),
       quantity
     });
   }));
-  const shippingLineItems = await mapShopifyShippingLinesToZohoLineItems(accessToken, order);
   const discountNote = getShopifyDiscountNote(order, totalDiscount);
+  const mappedTotal = getMappedInvoiceTotal(lineItems, shippingTotal);
+  const totalAdjustment = shopifyTotal > 0 ? roundMoney(shopifyTotal - mappedTotal) : 0;
 
   return withoutUndefined({
     customer_id: customerId,
@@ -534,14 +550,17 @@ async function mapShopifyOrderToZohoInvoice(accessToken, order, customerId) {
     place_of_supply: getShopifyOrderStateCode(order) || undefined,
     payment_terms: config.defaultPaymentTerms,
     is_inclusive_tax: config.zohoInclusiveTax,
-    is_discount_before_tax: true,
-    line_items: [...lineItems, ...shippingLineItems],
-    shipping_charge: shippingLineItems.length > 0 ? undefined : getShopifyShippingTotal(order),
+    is_discount_before_tax: false,
+    line_items: lineItems,
+    shipping_charge: shippingTotal,
+    adjustment: totalAdjustment !== 0 ? totalAdjustment : undefined,
+    adjustment_description: totalAdjustment !== 0 ? "Shopify total adjustment" : undefined,
     notes: [
       `Created automatically from Shopify order ${order.name ?? order.id}`,
       discountNote,
+      totalDiscount > 0 ? "Shopify discounts are already included in the item rates." : null,
       shippingTaxTotal > 0 ? `Shopify shipping GST included: ${shippingTaxTotal}` : null,
-      config.zohoInclusiveTax ? "Shopify shipping charges are treated as GST-inclusive. Product lines are not taxed in Zoho." : null
+      config.zohoInclusiveTax ? "Shopify product prices are treated as GST-inclusive." : null
     ]
       .filter(Boolean)
       .join("\n")
@@ -553,51 +572,7 @@ function getZohoItemIdForShopifyLineItem(_item) {
   return config.zohoDefaultItemId;
 }
 
-async function mapShopifyShippingLinesToZohoLineItems(accessToken, order) {
-  const shippingLines = order.shipping_lines ?? [];
-
-  if (shippingLines.length === 0) {
-    const shippingTotal = getShopifyShippingTotal(order);
-    const shippingTaxTotal = getShopifyShippingTaxAmount(order);
-
-    if (shippingTotal <= 0 || shippingTaxTotal <= 0) {
-      return [];
-    }
-
-    return [
-      withoutUndefined({
-        item_id: config.zohoDefaultItemId,
-        tax_id: (await getZohoTaxIdForShopifyTaxLines(accessToken, order, order.tax_lines ?? [], "shipping")) || undefined,
-        name: "Shipping Fee",
-        description: `Shopify shipping for order ${order.name ?? order.id}`,
-        rate: shippingTotal,
-        quantity: 1
-      })
-    ];
-  }
-
-  return Promise.all(
-    shippingLines.map(async (shippingLine) => {
-      const rate = getShopifyShippingLinePrice(shippingLine);
-      const shippingTaxAmount = getShopifyTaxLinesAmount(shippingLine.tax_lines);
-      const shouldApplyShippingTax = shippingTaxAmount > 0 || (shippingLines.length === 1 && getShopifyShippingTaxAmount(order) > 0);
-
-      return withoutUndefined({
-        item_id: config.zohoDefaultItemId,
-        tax_id:
-          shouldApplyShippingTax
-            ? (await getZohoTaxIdForShopifyTaxLines(accessToken, order, shippingLine.tax_lines ?? [], "shipping")) || undefined
-            : undefined,
-        name: shippingLine.title || shippingLine.code || "Shipping Fee",
-        description: `Shopify shipping line ${shippingLine.id ?? shippingLine.code ?? ""}`.trim(),
-        rate,
-        quantity: 1
-      });
-    })
-  );
-}
-
-async function getZohoTaxIdForShopifyTaxLines(accessToken, order, taxLines, source) {
+async function getZohoTaxForShopifyTaxLines(accessToken, order, taxLines, source) {
   const defaultTaxId = config.zohoDefaultTaxId || null;
   const taxCatalog = await getZohoTaxCatalog(accessToken);
   const taxRate =
@@ -606,7 +581,10 @@ async function getZohoTaxIdForShopifyTaxLines(accessToken, order, taxLines, sour
     getZohoTaxRateById(taxCatalog.taxes, defaultTaxId);
 
   if (taxRate === null) {
-    return defaultTaxId;
+    return {
+      taxId: defaultTaxId,
+      taxRate: null
+    };
   }
 
   const taxSpecification = isInterstateShopifyOrder(order, taxCatalog.organizationStateCode) ? "inter" : "intra";
@@ -625,7 +603,10 @@ async function getZohoTaxIdForShopifyTaxLines(accessToken, order, taxLines, sour
       selectedTaxRate: matchingTax.tax_percentage,
       selectedTaxSpecification: taxSpecification
     });
-    return matchingTax.tax_id;
+    return {
+      taxId: matchingTax.tax_id,
+      taxRate: roundMoney(money(matchingTax.tax_percentage))
+    };
   }
 
   log("Falling back to default Zoho tax", {
@@ -638,7 +619,10 @@ async function getZohoTaxIdForShopifyTaxLines(accessToken, order, taxLines, sour
     fallbackTaxId: defaultTaxId
   });
 
-  return defaultTaxId;
+  return {
+    taxId: defaultTaxId,
+    taxRate: getZohoTaxRateById(taxCatalog.taxes, defaultTaxId) ?? taxRate
+  };
 }
 
 function getZohoTaxRateById(taxes, taxId) {
@@ -1010,14 +994,54 @@ function getShopifyShippingTotal(order) {
   return roundMoney(money(order.total_shipping_price_set?.shop_money?.amount ?? order.total_shipping_price ?? 0));
 }
 
-function getShopifyShippingLinePrice(shippingLine) {
+function getShopifyLineItemBaseTotal(item) {
+  const quantity = Math.max(Number(item.quantity) || 0, 1);
+  return roundMoney(money(item.price) * quantity);
+}
+
+function getShopifyProductDiscountTotal(baseOrderTotal, shippingTotal, shopifyTotal, fallbackDiscountTotal) {
+  if (shopifyTotal <= 0) {
+    return Math.min(roundMoney(fallbackDiscountTotal), baseOrderTotal);
+  }
+
+  return Math.min(Math.max(roundMoney(baseOrderTotal + shippingTotal - shopifyTotal), 0), baseOrderTotal);
+}
+
+function getMappedInvoiceTotal(lineItems, shippingTotal) {
+  const lineTotal = (lineItems ?? []).reduce((total, item) => {
+    const quantity = Math.max(Number(item.quantity) || 0, 1);
+    return total + money(item.rate) * quantity;
+  }, 0);
+
+  return roundMoney(lineTotal + shippingTotal);
+}
+
+function getShopifyOrderTotal(order) {
   return roundMoney(
     money(
-      shippingLine.discounted_price_set?.shop_money?.amount ??
-        shippingLine.discounted_price ??
-        shippingLine.price_set?.shop_money?.amount ??
-        shippingLine.price
+      order.current_total_price_set?.shop_money?.amount ??
+        order.total_price_set?.shop_money?.amount ??
+        order.current_total_price ??
+        order.total_price
     )
+  );
+}
+
+function getZohoPayloadLineItemsTotal(invoicePayload) {
+  return roundMoney(
+    (invoicePayload.line_items ?? []).reduce((total, item) => {
+      const quantity = Math.max(Number(item.quantity) || 0, 1);
+      return total + money(item.rate) * quantity;
+    }, 0)
+  );
+}
+
+function getZohoPayloadTotal(invoicePayload) {
+  return roundMoney(
+    getZohoPayloadLineItemsTotal(invoicePayload) +
+      money(invoicePayload.shipping_charge) +
+      money(invoicePayload.adjustment) -
+      money(invoicePayload.discount)
   );
 }
 
@@ -1044,30 +1068,78 @@ function getShopifyOrderDiscountAmount(order) {
   );
 }
 
+function getShopifyLineItemDiscountDisplay(order, item, lineDiscount) {
+  if (lineDiscount <= 0) {
+    return null;
+  }
+
+  const lineLabels = getShopifyLineItemDiscountLabels(order, item);
+  const labels = lineLabels.length > 0 ? lineLabels : getShopifyOrderDiscountLabels(order);
+  const label = labels.length > 0 ? labels.join(", ") : "Shopify discount";
+
+  return `Discount applied: ${label} (-INR ${formatMoney(lineDiscount)})`;
+}
+
+function getShopifyLineItemDiscountLabels(order, item) {
+  return uniqueValues(
+    (item.discount_allocations ?? []).map((allocation) => {
+      const applicationIndex = Number(allocation.discount_application_index);
+      const application = Number.isInteger(applicationIndex) ? order.discount_applications?.[applicationIndex] : null;
+      return formatShopifyDiscountApplication(application);
+    })
+  );
+}
+
+function getShopifyOrderDiscountLabels(order) {
+  const codeLabels = (order.discount_codes ?? []).map((discountCode) => {
+    return formatShopifyDiscountParts(discountCode.code, null, discountCode.type);
+  });
+  const applicationLabels = (order.discount_applications ?? []).map(formatShopifyDiscountApplication);
+
+  return uniqueValues([...codeLabels, ...applicationLabels]);
+}
+
+function formatShopifyDiscountApplication(discountApplication) {
+  if (!discountApplication) {
+    return null;
+  }
+
+  return formatShopifyDiscountParts(
+    discountApplication.code ?? discountApplication.title,
+    discountApplication.value,
+    discountApplication.value_type
+  );
+}
+
+function formatShopifyDiscountParts(label, value, valueType) {
+  const parts = [label];
+
+  if (value && valueType === "percentage") {
+    parts.push(`${formatPercent(value)}%`);
+  } else if (value && valueType && valueType !== "discount_code") {
+    parts.push(String(valueType));
+  }
+
+  return parts.filter(Boolean).join(" ");
+}
+
+function formatPercent(value) {
+  const percentage = money(value);
+  return Number.isInteger(percentage) ? String(percentage) : formatMoney(percentage);
+}
+
+function formatMoney(value) {
+  return roundMoney(money(value)).toFixed(2);
+}
+
 function getShopifyDiscountNote(order, totalDiscount) {
   if (totalDiscount <= 0) {
     return null;
   }
 
-  const codeDetails = (order.discount_codes ?? [])
-    .map((discountCode) => {
-      return [discountCode.code, discountCode.type, discountCode.amount].filter(Boolean).join(" ");
-    })
-    .filter(Boolean);
-  const applicationDetails = (order.discount_applications ?? [])
-    .map((discountApplication) => {
-      return [
-        discountApplication.code ?? discountApplication.title,
-        discountApplication.type,
-        discountApplication.value ? `${discountApplication.value}${discountApplication.value_type === "percentage" ? "%" : ""}` : null
-      ]
-        .filter(Boolean)
-        .join(" ");
-    })
-    .filter(Boolean);
-  const details = [...new Set([...codeDetails, ...applicationDetails])];
+  const details = getShopifyOrderDiscountLabels(order);
 
-  return [`Shopify discount total: ${totalDiscount}`, details.length ? `Discount details: ${details.join(", ")}` : null]
+  return [`Shopify discount total: INR ${formatMoney(totalDiscount)}`, details.length ? `Discount details: ${details.join(", ")}` : null]
     .filter(Boolean)
     .join("\n");
 }
