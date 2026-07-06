@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 
-const APP_VERSION = "invoice-v16-visible-shopify-discounts";
+const APP_VERSION = "invoice-v17-retry-webhooks";
 
 const config = {
   port: Number(process.env.PORT ?? 3000),
@@ -56,16 +56,6 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  if (webhookId && processedWebhookIds.has(webhookId)) {
-    log("Duplicate Shopify webhook ignored", { webhookId });
-    sendJson(res, 200, { ok: true, duplicate: true });
-    return;
-  }
-
-  if (webhookId) {
-    processedWebhookIds.add(webhookId);
-  }
-
   let order;
   try {
     order = JSON.parse(rawBody.toString("utf8"));
@@ -86,33 +76,19 @@ const server = http.createServer(async (req, res) => {
     email: order.email ?? order.customer?.email ?? order.order?.email
   });
 
-  if (req.headers["x-codex-sync"] === "true") {
-    try {
-      await processShopifyWebhook(topic, order, getShopifyWebhookContext(req));
-      sendJson(res, 200, { ok: true, processed: true });
-    } catch (error) {
-      console.error("Failed to process Shopify webhook", {
-        topic,
-        shopifyResourceId: order.id,
-        shopifyOrderId: order.order_id ?? order.id,
-        orderName: order.name ?? order.order_name ?? order.order?.name,
-        error
-      });
-      log("Failed to process Shopify webhook", {
-        topic,
-        shopifyResourceId: order.id,
-        shopifyOrderId: order.order_id ?? order.id,
-        orderName: order.name ?? order.order_name ?? order.order?.name,
-        error: error.message
-      });
-      sendJson(res, 500, { ok: false, error: error.message });
-    }
+  if (webhookId && processedWebhookIds.has(webhookId)) {
+    log("Duplicate Shopify webhook ignored", { webhookId });
+    sendJson(res, 200, { ok: true, duplicate: true });
     return;
   }
 
-  sendJson(res, 200, { ok: true });
-
-  processShopifyWebhook(topic, order, getShopifyWebhookContext(req)).catch((error) => {
+  try {
+    await processShopifyWebhook(topic, order, getShopifyWebhookContext(req));
+    if (webhookId) {
+      processedWebhookIds.add(webhookId);
+    }
+    sendJson(res, 200, { ok: true, processed: true });
+  } catch (error) {
     console.error("Failed to process Shopify webhook", {
       topic,
       shopifyResourceId: order.id,
@@ -127,7 +103,8 @@ const server = http.createServer(async (req, res) => {
       orderName: order.name ?? order.order_name ?? order.order?.name,
       error: error.message
     });
-  });
+    sendJson(res, 500, { ok: false, error: error.message });
+  }
 });
 
 server.listen(config.port, () => {
@@ -178,6 +155,22 @@ async function processShopifyWebhook(topic, payload, context = {}) {
 
 async function processShopifyOrder(order) {
   const accessToken = await getZohoAccessToken();
+  const existingInvoice = await findZohoInvoiceForShopifyPayload(accessToken, order);
+
+  if (existingInvoice) {
+    cacheShopifyInvoice(order.id, {
+      invoiceId: existingInvoice.invoice_id,
+      referenceNumber: existingInvoice.reference_number
+    });
+    log("Zoho invoice already exists for Shopify order", {
+      shopifyOrderId: order.id,
+      shopifyOrderName: order.name,
+      zohoInvoiceId: existingInvoice.invoice_id,
+      zohoInvoiceNumber: existingInvoice.invoice_number
+    });
+    return;
+  }
+
   const customerId = await findOrCreateZohoCustomer(accessToken, order);
   const invoicePayload = await mapShopifyOrderToZohoInvoice(accessToken, order, customerId);
   log("Prepared Zoho invoice payload", {
