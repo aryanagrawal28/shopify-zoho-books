@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 
-const APP_VERSION = "invoice-v23-locked-calculation-oauth-cache-v2";
+const APP_VERSION = "invoice-v23-locked-calculation-oauth-cache-v3";
 
 const config = {
   port: Number(process.env.PORT ?? 3000),
@@ -819,15 +819,7 @@ async function findZohoInvoiceForShopifyPayload(accessToken, payload) {
     return getZohoInvoice(accessToken, cached.invoiceId);
   }
 
-  for (const reference of getShopifyInvoiceReferenceCandidates(payload)) {
-    const invoice = await findZohoInvoiceByReference(accessToken, reference);
-
-    if (invoice) {
-      return invoice;
-    }
-  }
-
-  return null;
+  return findZohoInvoiceByReferences(accessToken, getShopifyInvoiceReferenceCandidates(payload));
 }
 
 async function getZohoInvoice(accessToken, invoiceId) {
@@ -835,17 +827,40 @@ async function getZohoInvoice(accessToken, invoiceId) {
   return body.invoice ?? null;
 }
 
-async function findZohoInvoiceByReference(accessToken, referenceNumber) {
-  const url = zohoBooksUrl("/books/v3/invoices");
-  url.searchParams.set("search_text", String(referenceNumber).replace(/^#/, ""));
-  url.searchParams.set("per_page", "20");
+async function findZohoInvoiceByReferences(accessToken, referenceNumbers) {
+  const normalizedReferences = referenceNumbers.map(normalizeInvoiceReference).filter(Boolean);
+  let page = 1;
 
-  const body = await zohoFetch(accessToken, url);
-  return (
-    body.invoices?.find((invoice) => {
-      return invoice.reference_number === referenceNumber || invoice.reference_number?.includes(referenceNumber);
-    }) ?? null
-  );
+  while (page <= 50) {
+    const url = zohoBooksUrl("/books/v3/invoices");
+    url.searchParams.set("page", String(page));
+    url.searchParams.set("per_page", "200");
+
+    const body = await zohoFetch(accessToken, url);
+    const invoices = Array.isArray(body.invoices) ? body.invoices : [];
+    const matchingInvoice = invoices.find((invoice) => {
+      const invoiceReference = normalizeInvoiceReference(invoice.reference_number);
+      return normalizedReferences.some((reference) => {
+        return invoiceReference === reference || invoiceReference.includes(reference) || reference.includes(invoiceReference);
+      });
+    });
+
+    if (matchingInvoice) {
+      return matchingInvoice;
+    }
+
+    if (!body.page_context?.has_more_page) {
+      return null;
+    }
+
+    page += 1;
+  }
+
+  throw new Error("Zoho invoice lookup exceeded 50 pages");
+}
+
+function normalizeInvoiceReference(value) {
+  return String(value ?? "").trim().replace(/^#/, "").toLowerCase();
 }
 
 async function findZohoCreditNoteByReference(accessToken, referenceNumber) {
