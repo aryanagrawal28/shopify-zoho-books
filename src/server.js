@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 
-const APP_VERSION = "invoice-v23-locked-calculation-oauth-cache-v1";
+const APP_VERSION = "invoice-v23-locked-calculation-oauth-cache-v2";
 
 const config = {
   port: Number(process.env.PORT ?? 3000),
@@ -837,7 +837,7 @@ async function getZohoInvoice(accessToken, invoiceId) {
 
 async function findZohoInvoiceByReference(accessToken, referenceNumber) {
   const url = zohoBooksUrl("/books/v3/invoices");
-  url.searchParams.set("reference_number", referenceNumber);
+  url.searchParams.set("search_text", String(referenceNumber).replace(/^#/, ""));
   url.searchParams.set("per_page", "20");
 
   const body = await zohoFetch(accessToken, url);
