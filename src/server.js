@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 
-const APP_VERSION = "invoice-v20-auto-payment";
+const APP_VERSION = "invoice-v21-payment-updates";
 
 const config = {
   port: Number(process.env.PORT ?? 3000),
