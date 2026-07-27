@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 
-const APP_VERSION = "invoice-v23-locked-calculation";
+const APP_VERSION = "invoice-v23-locked-calculation-oauth-cache-v1";
 
 const config = {
   port: Number(process.env.PORT ?? 3000),
@@ -25,6 +25,8 @@ const config = {
 const processedWebhookIds = new Set();
 const shopifyOrderInvoiceCache = new Map();
 let zohoTaxCatalogPromise;
+let zohoAccessTokenCache;
+let zohoAccessTokenPromise;
 
 const server = http.createServer(async (req, res) => {
   log("Incoming request", {
@@ -380,6 +382,22 @@ async function processShopifyRefund(refund, context = {}) {
 }
 
 async function getZohoAccessToken() {
+  const now = Date.now();
+
+  if (zohoAccessTokenCache && zohoAccessTokenCache.expiresAt > now) {
+    return zohoAccessTokenCache.accessToken;
+  }
+
+  if (!zohoAccessTokenPromise) {
+    zohoAccessTokenPromise = refreshZohoAccessToken().finally(() => {
+      zohoAccessTokenPromise = undefined;
+    });
+  }
+
+  return zohoAccessTokenPromise;
+}
+
+async function refreshZohoAccessToken() {
   const url = new URL("/oauth/v2/token", config.zohoAccountsDomain);
   url.searchParams.set("refresh_token", config.zohoRefreshToken);
   url.searchParams.set("client_id", config.zohoClientId);
@@ -392,6 +410,12 @@ async function getZohoAccessToken() {
   if (!response.ok || !body.access_token) {
     throw new Error(`Zoho token refresh failed: ${JSON.stringify(body)}`);
   }
+
+  const expiresInSeconds = Math.max(Number(body.expires_in ?? 3600) - 120, 60);
+  zohoAccessTokenCache = {
+    accessToken: body.access_token,
+    expiresAt: Date.now() + expiresInSeconds * 1000
+  };
 
   return body.access_token;
 }
@@ -813,8 +837,7 @@ async function getZohoInvoice(accessToken, invoiceId) {
 
 async function findZohoInvoiceByReference(accessToken, referenceNumber) {
   const url = zohoBooksUrl("/books/v3/invoices");
-  url.searchParams.set("search_text", referenceNumber);
-  url.searchParams.set("filter_by", "Status.All");
+  url.searchParams.set("reference_number", referenceNumber);
   url.searchParams.set("per_page", "20");
 
   const body = await zohoFetch(accessToken, url);
