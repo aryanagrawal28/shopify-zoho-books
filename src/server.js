@@ -232,6 +232,10 @@ async function processShopifyOrderUpdate(order, context = {}) {
     return;
   }
 
+  if (isShopifyOrderPaid(order)) {
+    await processShopifyOrder(order);
+  }
+
   if (refunds.length === 0) {
     log("Shopify order update has no refunds to process", {
       shopifyOrderId: order.id,
