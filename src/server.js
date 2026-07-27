@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 
-const APP_VERSION = "invoice-v22-zoho-discount-compat";
+const APP_VERSION = "invoice-v23-locked-calculation";
 
 const config = {
   port: Number(process.env.PORT ?? 3000),
@@ -632,7 +632,7 @@ async function mapShopifyOrderToZohoInvoice(accessToken, order, customerId) {
     discount: totalDiscount > 0 ? totalDiscount : undefined,
     discount_type: totalDiscount > 0 ? "entity_level" : undefined,
     is_inclusive_tax: config.zohoInclusiveTax,
-    is_discount_before_tax: true,
+    is_discount_before_tax: false,
     line_items: lineItems,
     shipping_charge: shippingTotal,
     adjustment: totalAdjustment !== 0 ? totalAdjustment : undefined,
