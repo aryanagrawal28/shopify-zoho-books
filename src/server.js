@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 
-const APP_VERSION = "invoice-v23-locked-calculation-sync-v6";
+const APP_VERSION = "invoice-v23-locked-calculation-sync-v7";
 
 const config = {
   port: Number(process.env.PORT ?? 3000),
@@ -189,7 +189,13 @@ async function processShopifyOrder(order) {
     mappedTotal: getZohoPayloadTotal(invoicePayload),
     shippingCharge: invoicePayload.shipping_charge ?? 0,
     adjustment: invoicePayload.adjustment ?? 0,
-    lineItemsTotal: getZohoPayloadLineItemsTotal(invoicePayload)
+    lineItemsTotal: getZohoPayloadLineItemsTotal(invoicePayload),
+    discount: invoicePayload.discount ?? 0,
+    discountType: invoicePayload.discount_type,
+    isDiscountBeforeTax: invoicePayload.is_discount_before_tax,
+    lineItemDiscountCount: invoicePayload.line_items?.filter((item) => {
+      return item.discount !== undefined || item.discount_amount !== undefined;
+    }).length ?? 0
   });
   const invoice = await createZohoInvoice(accessToken, invoicePayload);
   cacheShopifyInvoice(order.id, {
@@ -511,21 +517,21 @@ async function createZohoInvoice(accessToken, payload) {
       body: JSON.stringify(payload)
     });
   } catch (error) {
-    const isAfterTaxPreferenceConflict =
+    const isDiscountTaxConflict =
       error instanceof Error &&
-      error.message.includes('"code":4089') &&
-      payload.discount_type === "entity_level" &&
-      payload.is_discount_before_tax === false;
+      /"code"\s*:\s*4089\b/.test(error.message);
 
-    if (!isAfterTaxPreferenceConflict) {
+    if (!isDiscountTaxConflict) {
       throw error;
     }
 
-    const compatibilityPayload = { ...payload };
-    delete compatibilityPayload.is_discount_before_tax;
-    delete compatibilityPayload.discount_type;
+    const compatibilityPayload = {
+      ...payload,
+      discount_type: "entity_level",
+      is_discount_before_tax: true
+    };
 
-    log("Retrying Zoho invoice using saved organisation discount controls", {
+    log("Retrying Zoho invoice with transaction-level discount before tax", {
       referenceNumber: payload.reference_number,
       discount: payload.discount,
       requestedDiscountType: payload.discount_type,
@@ -688,7 +694,7 @@ async function mapShopifyOrderToZohoInvoice(accessToken, order, customerId) {
     discount: totalDiscount > 0 ? totalDiscount : undefined,
     discount_type: totalDiscount > 0 ? "entity_level" : undefined,
     is_inclusive_tax: config.zohoInclusiveTax,
-    is_discount_before_tax: false,
+    is_discount_before_tax: totalDiscount > 0,
     line_items: lineItems,
     shipping_charge: shippingTotal,
     adjustment: totalAdjustment !== 0 ? totalAdjustment : undefined,
