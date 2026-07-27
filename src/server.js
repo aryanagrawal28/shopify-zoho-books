@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 
-const APP_VERSION = "invoice-v23-locked-calculation-sync-v5";
+const APP_VERSION = "invoice-v23-locked-calculation-sync-v6";
 
 const config = {
   port: Number(process.env.PORT ?? 3000),
@@ -523,11 +523,12 @@ async function createZohoInvoice(accessToken, payload) {
 
     const compatibilityPayload = { ...payload };
     delete compatibilityPayload.is_discount_before_tax;
+    delete compatibilityPayload.discount_type;
 
-    log("Retrying Zoho invoice with saved organisation discount preference", {
+    log("Retrying Zoho invoice using saved organisation discount controls", {
       referenceNumber: payload.reference_number,
       discount: payload.discount,
-      discountType: payload.discount_type,
+      requestedDiscountType: payload.discount_type,
       lineItemDiscountCount: payload.line_items?.filter((item) => {
         return item.discount !== undefined || item.discount_amount !== undefined;
       }).length ?? 0
