@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 
-const APP_VERSION = "invoice-v19-zoho-summary-tax";
+const APP_VERSION = "invoice-v20-auto-payment";
 
 const config = {
   port: Number(process.env.PORT ?? 3000),
@@ -16,6 +16,9 @@ const config = {
   zohoDefaultItemId: requiredEnv("ZOHO_DEFAULT_ITEM_ID"),
   zohoDefaultTaxId: optionalEnv("ZOHO_DEFAULT_TAX_ID"),
   zohoInclusiveTax: parseBoolean(optionalEnv("ZOHO_INCLUSIVE_TAX", "true")),
+  zohoAutoRecordPayments: parseBoolean(optionalEnv("ZOHO_AUTO_RECORD_PAYMENTS", "true")),
+  zohoPaymentMode: optionalEnv("ZOHO_PAYMENT_MODE", "others"),
+  zohoPaymentAccountId: optionalEnv("ZOHO_PAYMENT_ACCOUNT_ID"),
   defaultPaymentTerms: Number(optionalEnv("ZOHO_DEFAULT_PAYMENT_TERMS", "0"))
 };
 
@@ -119,7 +122,10 @@ server.listen(config.port, () => {
     zohoOrganizationId: config.zohoOrganizationId,
     zohoDefaultItemId: config.zohoDefaultItemId,
     zohoDefaultTaxId: config.zohoDefaultTaxId,
-    zohoInclusiveTax: config.zohoInclusiveTax
+    zohoInclusiveTax: config.zohoInclusiveTax,
+    zohoAutoRecordPayments: config.zohoAutoRecordPayments,
+    zohoPaymentMode: config.zohoPaymentMode,
+    zohoPaymentAccountConfigured: Boolean(config.zohoPaymentAccountId)
   });
 });
 
@@ -168,6 +174,7 @@ async function processShopifyOrder(order) {
       zohoInvoiceId: existingInvoice.invoice_id,
       zohoInvoiceNumber: existingInvoice.invoice_number
     });
+    await ensureZohoInvoicePaidForShopifyOrder(accessToken, existingInvoice, order);
     return;
   }
 
@@ -187,6 +194,14 @@ async function processShopifyOrder(order) {
     invoiceId: invoice.invoice?.invoice_id,
     referenceNumber: invoice.invoice?.reference_number ?? invoicePayload.reference_number
   });
+  await ensureZohoInvoicePaidForShopifyOrder(
+    accessToken,
+    {
+      ...invoice.invoice,
+      customer_id: invoice.invoice?.customer_id ?? customerId
+    },
+    order
+  );
 
   console.log("Created Zoho invoice", {
     shopifyOrderId: order.id,
@@ -463,6 +478,92 @@ async function createZohoInvoice(accessToken, payload) {
   return zohoFetch(accessToken, zohoBooksUrl("/books/v3/invoices"), {
     method: "POST",
     body: JSON.stringify(payload)
+  });
+}
+
+async function ensureZohoInvoicePaidForShopifyOrder(accessToken, invoice, order) {
+  if (!config.zohoAutoRecordPayments || !isShopifyOrderPaid(order)) {
+    log("Skipped Zoho payment for Shopify order", {
+      shopifyOrderId: order.id,
+      shopifyOrderName: order.name,
+      financialStatus: getShopifyFinancialStatus(order),
+      autoRecordPayments: config.zohoAutoRecordPayments
+    });
+    return;
+  }
+
+  const invoiceId = invoice?.invoice_id;
+
+  if (!invoiceId) {
+    throw new Error(`Zoho invoice ID is missing for paid Shopify order ${order.name ?? order.id}`);
+  }
+
+  let currentInvoice = await getZohoInvoice(accessToken, invoiceId);
+
+  if (!currentInvoice) {
+    throw new Error(`Could not reload Zoho invoice ${invoiceId} before recording payment`);
+  }
+
+  if (String(currentInvoice.status ?? "").toLowerCase() === "draft") {
+    await markZohoInvoiceAsSent(accessToken, invoiceId);
+    currentInvoice = await getZohoInvoice(accessToken, invoiceId);
+  }
+
+  const balance = roundMoney(Math.max(money(currentInvoice?.balance), 0));
+
+  if (balance <= 0) {
+    log("Zoho invoice is already paid", {
+      shopifyOrderId: order.id,
+      shopifyOrderName: order.name,
+      zohoInvoiceId: invoiceId,
+      zohoInvoiceNumber: currentInvoice?.invoice_number
+    });
+    return;
+  }
+
+  const customerId = currentInvoice?.customer_id ?? invoice.customer_id;
+
+  if (!customerId) {
+    throw new Error(`Zoho customer ID is missing for invoice ${invoiceId}`);
+  }
+
+  const payment = await createZohoCustomerPayment(accessToken, {
+    customer_id: customerId,
+    payment_mode: config.zohoPaymentMode,
+    amount: balance,
+    date: getShopifyPaymentDate(order),
+    reference_number: `Shopify ${order.name ?? order.id}`.slice(0, 100),
+    description: `Payment received in Shopify for order ${order.name ?? order.id}`,
+    invoices: [
+      {
+        invoice_id: invoiceId,
+        amount_applied: balance
+      }
+    ],
+    account_id: config.zohoPaymentAccountId || undefined
+  });
+
+  log("Recorded Zoho payment for paid Shopify order", {
+    shopifyOrderId: order.id,
+    shopifyOrderName: order.name,
+    financialStatus: getShopifyFinancialStatus(order),
+    zohoInvoiceId: invoiceId,
+    zohoInvoiceNumber: currentInvoice.invoice_number,
+    zohoPaymentId: payment.payment?.payment_id,
+    amountApplied: balance
+  });
+}
+
+async function markZohoInvoiceAsSent(accessToken, invoiceId) {
+  return zohoFetch(accessToken, zohoBooksUrl(`/books/v3/invoices/${invoiceId}/status/sent`), {
+    method: "POST"
+  });
+}
+
+async function createZohoCustomerPayment(accessToken, payload) {
+  return zohoFetch(accessToken, zohoBooksUrl("/books/v3/customerpayments"), {
+    method: "POST",
+    body: JSON.stringify(withoutUndefined(payload))
   });
 }
 
@@ -1121,6 +1222,20 @@ function normalizeIndianStateCode(value) {
   }
 
   return INDIAN_STATE_CODES[normalized] ?? normalized;
+}
+
+function getShopifyFinancialStatus(order) {
+  return String(order.financial_status ?? order.display_financial_status ?? "")
+    .trim()
+    .toLowerCase();
+}
+
+function isShopifyOrderPaid(order) {
+  return getShopifyFinancialStatus(order) === "paid";
+}
+
+function getShopifyPaymentDate(order) {
+  return (order.processed_at ?? order.created_at ?? new Date().toISOString()).slice(0, 10);
 }
 
 function money(value) {
