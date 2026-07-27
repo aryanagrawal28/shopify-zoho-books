@@ -9,12 +9,14 @@ Create a Zoho API client and generate a refresh token with offline access. The u
 ```text
 ZohoBooks.invoices.CREATE
 ZohoBooks.invoices.READ
+ZohoBooks.invoices.UPDATE
 ZohoBooks.contacts.READ
 ZohoBooks.contacts.CREATE
 ZohoBooks.items.READ
 ZohoBooks.settings.READ
 ZohoBooks.creditnotes.CREATE
 ZohoBooks.creditnotes.READ
+ZohoBooks.customerpayments.CREATE
 ```
 
 Find your Zoho Books organization ID from Zoho Books or the Organizations API, then copy `.env.example` to `.env` and fill in the Zoho values.
@@ -67,6 +69,10 @@ Zoho invoice line items need a Zoho `item_id`. The starter uses `ZOHO_DEFAULT_IT
 Shopify order discounts are sent to Zoho as an invoice-level discount so the Zoho invoice total matches the Shopify paid total. Discount codes and discount application details are added to the Zoho invoice notes.
 
 By default, `ZOHO_INCLUSIVE_TAX=true`, so Shopify shipping tax is treated as inclusive while product lines are not taxed again in Zoho. For example, Shopify product totals and discounts stay at the paid Shopify amount, and any Shopify shipping GST is shown inside the shipping charge instead of being added on top.
+
+When Shopify reports an order as fully paid, the app marks a draft Zoho invoice as sent and records a customer payment for Zoho's current invoice balance. This changes the Zoho invoice to paid without recalculating or modifying the invoice line items, discount, tax, shipping, or total. Webhook retries first re-read the Zoho balance, so an already-paid invoice is not paid twice. Pending, partially paid, and COD orders remain unpaid in Zoho.
+
+Set `ZOHO_AUTO_RECORD_PAYMENTS=false` to disable this behavior. `ZOHO_PAYMENT_MODE` defaults to `others`; optionally set `ZOHO_PAYMENT_ACCOUNT_ID` to the Zoho cash or bank account that should receive Shopify payments.
 
 Shopify refunds and cancellations create Zoho credit notes associated with the original invoice, preserving the invoice record while deducting the appropriate amount. The app finds the original invoice using the Shopify order number saved as Zoho `reference_number`.
 
