@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 
-const APP_VERSION = "invoice-v23-locked-calculation-sync-v4";
+const APP_VERSION = "invoice-v23-locked-calculation-sync-v5";
 
 const config = {
   port: Number(process.env.PORT ?? 3000),
@@ -503,10 +503,41 @@ function getZohoContactName(firstName, lastName, email, orderId) {
 }
 
 async function createZohoInvoice(accessToken, payload) {
-  return zohoFetch(accessToken, zohoBooksUrl("/books/v3/invoices"), {
-    method: "POST",
-    body: JSON.stringify(payload)
-  });
+  const url = zohoBooksUrl("/books/v3/invoices");
+
+  try {
+    return await zohoFetch(accessToken, url, {
+      method: "POST",
+      body: JSON.stringify(payload)
+    });
+  } catch (error) {
+    const isAfterTaxPreferenceConflict =
+      error instanceof Error &&
+      error.message.includes('"code":4089') &&
+      payload.discount_type === "entity_level" &&
+      payload.is_discount_before_tax === false;
+
+    if (!isAfterTaxPreferenceConflict) {
+      throw error;
+    }
+
+    const compatibilityPayload = { ...payload };
+    delete compatibilityPayload.is_discount_before_tax;
+
+    log("Retrying Zoho invoice with saved organisation discount preference", {
+      referenceNumber: payload.reference_number,
+      discount: payload.discount,
+      discountType: payload.discount_type,
+      lineItemDiscountCount: payload.line_items?.filter((item) => {
+        return item.discount !== undefined || item.discount_amount !== undefined;
+      }).length ?? 0
+    });
+
+    return zohoFetch(accessToken, url, {
+      method: "POST",
+      body: JSON.stringify(compatibilityPayload)
+    });
+  }
 }
 
 async function ensureZohoInvoicePaidForShopifyOrder(accessToken, invoice, order) {
