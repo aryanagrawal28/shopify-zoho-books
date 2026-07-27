@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 
-const APP_VERSION = "invoice-v23-locked-calculation-oauth-cache-v3";
+const APP_VERSION = "invoice-v23-locked-calculation-sync-v4";
 
 const config = {
   port: Number(process.env.PORT ?? 3000),
@@ -840,8 +840,13 @@ async function findZohoInvoiceByReferences(accessToken, referenceNumbers) {
     const invoices = Array.isArray(body.invoices) ? body.invoices : [];
     const matchingInvoice = invoices.find((invoice) => {
       const invoiceReference = normalizeInvoiceReference(invoice.reference_number);
+
+      if (!invoiceReference) {
+        return false;
+      }
+
       return normalizedReferences.some((reference) => {
-        return invoiceReference === reference || invoiceReference.includes(reference) || reference.includes(invoiceReference);
+        return invoiceReference === reference || invoiceReference.includes(reference);
       });
     });
 
