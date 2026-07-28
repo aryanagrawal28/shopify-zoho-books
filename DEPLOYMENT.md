@@ -35,6 +35,7 @@ It should return:
 ```text
 Order creation:      https://YOUR_PRODUCTION_DOMAIN/webhooks/shopify/orders-create
 Order updated:       https://YOUR_PRODUCTION_DOMAIN/webhooks/shopify/orders-updated
+Order paid:          https://YOUR_PRODUCTION_DOMAIN/webhooks/shopify/orders-paid
 Order cancellation:  https://YOUR_PRODUCTION_DOMAIN/webhooks/shopify/orders-cancelled
 Refund creation:     https://YOUR_PRODUCTION_DOMAIN/webhooks/shopify/refunds-create
 ```
@@ -78,6 +79,7 @@ https://YOUR_RENDER_SERVICE.onrender.com/health
 ```text
 Order creation:      https://YOUR_RENDER_SERVICE.onrender.com/webhooks/shopify/orders-create
 Order updated:       https://YOUR_RENDER_SERVICE.onrender.com/webhooks/shopify/orders-updated
+Order paid:          https://YOUR_RENDER_SERVICE.onrender.com/webhooks/shopify/orders-paid
 Order cancellation:  https://YOUR_RENDER_SERVICE.onrender.com/webhooks/shopify/orders-cancelled
 Refund creation:     https://YOUR_RENDER_SERVICE.onrender.com/webhooks/shopify/refunds-create
 ```

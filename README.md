@@ -38,6 +38,7 @@ Create a Shopify app or use an existing custom app. Subscribe to these webhooks:
 ```text
 orders/create
 orders/updated
+orders/paid
 orders/cancelled
 refunds/create
 ```
@@ -52,6 +53,7 @@ The path can use the event name for clarity, for example:
 
 ```text
 https://YOUR_DOMAIN/webhooks/shopify/orders-updated
+https://YOUR_DOMAIN/webhooks/shopify/orders-paid
 https://YOUR_DOMAIN/webhooks/shopify/orders-cancelled
 https://YOUR_DOMAIN/webhooks/shopify/refunds-create
 ```
@@ -70,7 +72,7 @@ Shopify order discounts are sent to Zoho as an invoice-level discount so the Zoh
 
 By default, `ZOHO_INCLUSIVE_TAX=true`, so Shopify shipping tax is treated as inclusive while product lines are not taxed again in Zoho. For example, Shopify product totals and discounts stay at the paid Shopify amount, and any Shopify shipping GST is shown inside the shipping charge instead of being added on top.
 
-When Shopify reports an order as fully paid, the app marks a draft Zoho invoice as sent and records a customer payment for Zoho's current invoice balance. This changes the Zoho invoice to paid without recalculating or modifying the invoice line items, discount, tax, shipping, or total. Webhook retries first re-read the Zoho balance, so an already-paid invoice is not paid twice. Pending, partially paid, and COD orders remain unpaid in Zoho.
+When Shopify reports an order as fully paid through `orders/updated` or `orders/paid`, the app marks a draft Zoho invoice as sent and records a customer payment for Zoho's current invoice balance. This changes the Zoho invoice to paid without recalculating or modifying the invoice line items, discount, tax, shipping, or total. Processing is serialized per Shopify order so overlapping create/update/paid deliveries cannot create duplicate invoices. Webhook retries first re-read the Zoho balance, so an already-paid invoice is not paid twice. Pending, partially paid, and COD orders remain unpaid in Zoho.
 
 Set `ZOHO_AUTO_RECORD_PAYMENTS=false` to disable this behavior. `ZOHO_PAYMENT_MODE` defaults to `others`; optionally set `ZOHO_PAYMENT_ACCOUNT_ID` to the Zoho cash or bank account that should receive Shopify payments.
 

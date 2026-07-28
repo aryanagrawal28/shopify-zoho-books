@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 
-const APP_VERSION = "invoice-v23-locked-calculation-sync-v7";
+const APP_VERSION = "invoice-v23-locked-calculation-sync-v8";
 
 const config = {
   port: Number(process.env.PORT ?? 3000),
@@ -24,6 +24,7 @@ const config = {
 
 const processedWebhookIds = new Set();
 const shopifyOrderInvoiceCache = new Map();
+const shopifyOrderProcessingLocks = new Map();
 let zohoTaxCatalogPromise;
 let zohoAccessTokenCache;
 let zohoAccessTokenPromise;
@@ -153,6 +154,11 @@ async function processShopifyWebhook(topic, payload, context = {}) {
     return;
   }
 
+  if (topic === "orders/paid") {
+    await processShopifyOrder(payload);
+    return;
+  }
+
   if (topic === "refunds/create") {
     await processShopifyRefund(payload, context);
     return;
@@ -162,6 +168,38 @@ async function processShopifyWebhook(topic, payload, context = {}) {
 }
 
 async function processShopifyOrder(order) {
+  const orderKey = getShopifyOrderProcessingKey(order);
+
+  if (!orderKey) {
+    await processShopifyOrderUnlocked(order);
+    return;
+  }
+
+  const previousProcessing = shopifyOrderProcessingLocks.get(orderKey);
+  const currentProcessing = (previousProcessing ?? Promise.resolve())
+    .catch(() => {})
+    .then(() => processShopifyOrderUnlocked(order));
+
+  shopifyOrderProcessingLocks.set(orderKey, currentProcessing);
+
+  if (previousProcessing) {
+    log("Queued Shopify order behind in-flight processing", {
+      shopifyOrderId: order.id,
+      shopifyOrderName: order.name,
+      financialStatus: getShopifyFinancialStatus(order)
+    });
+  }
+
+  try {
+    await currentProcessing;
+  } finally {
+    if (shopifyOrderProcessingLocks.get(orderKey) === currentProcessing) {
+      shopifyOrderProcessingLocks.delete(orderKey);
+    }
+  }
+}
+
+async function processShopifyOrderUnlocked(order) {
   const accessToken = await getZohoAccessToken();
   const existingInvoice = await findZohoInvoiceForShopifyPayload(accessToken, order);
 
@@ -223,6 +261,10 @@ async function processShopifyOrder(order) {
     zohoInvoiceId: invoice.invoice?.invoice_id,
     zohoInvoiceNumber: invoice.invoice?.invoice_number
   });
+}
+
+function getShopifyOrderProcessingKey(order) {
+  return String(order.id ?? order.order_id ?? order.name ?? order.order_name ?? "").trim();
 }
 
 async function processShopifyOrderUpdate(order, context = {}) {
